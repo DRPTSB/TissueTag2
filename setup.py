@@ -30,7 +30,8 @@ setup(
         'bin2cell',
         'packaging',
         'tifffile',
-        'imagecodecs'
+        'imagecodecs',
+        'tinybrain'
     ],
     author='Oren Amsalem, Nadav Yayon, Andrian Yang',
     author_email='ny1@sanger.ac.uk',
