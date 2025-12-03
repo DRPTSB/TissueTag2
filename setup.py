@@ -5,7 +5,7 @@ with open("README.md", "r") as fh:
 
 setup(
     name='tissue-tag',
-    version='0.2.2',
+    version='0.2.3',
     packages=find_packages(),
     install_requires=[
         'opencv-python',
@@ -20,7 +20,7 @@ setup(
         'scikit-learn',
         'holoviews',
         'datashader',
-        'panel==1.4.5',
+        'panel',
         'scanpy',
         'jupyterlab',
         'tables',
@@ -33,12 +33,15 @@ setup(
         'imagecodecs',
         'tinybrain'
     ],
+    extras_require={
+        "geojson": ["rasterio"],
+    },
     author='Oren Amsalem, Nadav Yayon, Andrian Yang',
     author_email='ny1@sanger.ac.uk',
     description="Tissue Tag: jupyter image annotator",
     long_description=long_description,
     long_description_content_type="text/markdown",
-    url='https://github.com/nadavyayon/TissueTag',
+    url='https://github.com/DRPTSB/TissueTag2',
     classifiers=[
         'Programming Language :: Python :: 3',
         'Operating System :: OS Independent',
