@@ -93,11 +93,13 @@ def load_annotation(file_path):
 
 def read_image(
     path,
-    ppm_image=None,
-    ppm_out=1,
-    contrast_factor=1,
-    background_image_path=None,
-    plot=True,
+    ppm_image = None,
+    ppm_out = 1,
+    contrast_factor = 1,
+    background_image_path = None,
+    flip_y_axis = False,
+    annotation_file = None,
+    plot = True,
 ) -> TissueTagAnnotation:
     """
     Reads an H&E or fluorescent image and returns the image with optional enhancements.
@@ -118,6 +120,10 @@ def read_image(
     background_image_path : str, optional
         Path to a background image. If provided, this image and the input image are combined
         to create a virtual H&E (vH&E). If not provided, vH&E will not be performed.
+    flip_y_axis: bool, optional
+        Whether to flip the y-axis when loading in the image (default: False).
+    annotation_file: str, optional
+        Path to GeoJSON object containing annotation features. Expects GeoJSON object in the structure of QuPath GeoJSON output.
     plot : boolean, optional
         if to plot the loaded image. Defaults to True.
 
@@ -134,8 +140,8 @@ def read_image(
             print('found ppm in image metadata!, its - '+str(ppm_image))
         except:
             print('could not find ppm in image metadata, please provide ppm value')
-    width, height = im.size
-    newsize = (int(width/ppm_image*ppm_out), int(height/ppm_image*ppm_out))
+    full_width, full_height = im.size
+    newsize = (int(full_width/ppm_image*ppm_out), int(full_height/ppm_image*ppm_out))
     # resize
     im = im.resize(newsize,Image.Resampling.LANCZOS)
     im = im.convert("RGBA")
@@ -157,20 +163,33 @@ def read_image(
         # im2 = im2.convert("RGBA")
         im = simonson_vHE(np.array(im).astype('uint8'),np.array(im2).astype('uint8'))
 
+    im = np.array(im)
+    if flip_y_axis:
+        im = np.flipud(im)
+
     if plot:
         plt.figure(dpi=100)
         plt.imshow(im,origin='lower')
         plt.show()
 
-    return TissueTagAnnotation(np.array(im), ppm_out)
+    if annotation_file:
+        width, height = im.shape[:2]
+        label_image, annotation_map = import_geojson_annotation(annotation_file, (full_width, full_height),
+                                                                (width, height), flip_y_axis=flip_y_axis)
+    else:
+        label_image, annotation_map = None, None
+
+    return TissueTagAnnotation(image=im, ppm=ppm_out, label_image=label_image, annotation_map=annotation_map)
 
 
 def read_visium(
     spaceranger_dir_path,
-    use_resolution='hires',
+    use_resolution = 'hires',
     ppm_out = None,
     mapped_image_path = None,
     in_tissue = True,
+    flip_y_axis = False,
+    annotation_file = None,
     plot = False,
 ) -> TissueTagAnnotation:
     """
@@ -192,6 +211,10 @@ def read_visium(
         set to 'mapped_res'.
     in_tissue : bool, optional
         Whether to include only tissue bins (default: True).
+    flip_y_axis: bool, optional
+        Whether to flip the y-axis when loading in the image (default: False).
+    annotation_file: str, optional
+        Path to GeoJSON object containing annotation features. Expects GeoJSON object in the structure of QuPath GeoJSON output.
     plot : bool, optional
         Whether to plot the output image (default: False).
 
@@ -250,11 +273,11 @@ def read_visium(
 
     im = Image.open(image_files[use_resolution])
     ppm_anno = fullres_ppm * scalefactors[f"tissue_{use_resolution}_scalef"] if use_resolution != "mapped_res" else fullres_ppm # adjust resolution to the image
+    full_width, full_height = im.size
 
     # rescale image to target
     if ppm_out:
-        width, height = im.size
-        new_size = (int(width * ppm_out / ppm_anno), int(height * ppm_out / ppm_anno))
+        new_size = (int(full_width * ppm_out / ppm_anno), int(full_height * ppm_out / ppm_anno))
         im = im.resize(new_size, Image.Resampling.LANCZOS)
         ppm_anno = ppm_out
 
@@ -269,7 +292,14 @@ def read_visium(
     if plot:
         plot_10x_spatial_image(im, df, ppm_anno, 55, dpi=300, blowup_size_um=250, technology="Visium", image_info="Image resolution: " + use_resolution)
 
-    return TissueTagAnnotation(image=im,ppm=ppm_anno,positions=df)
+    if annotation_file:
+        width, height = im.shape[:2]
+        label_image, annotation_map = import_geojson_annotation(annotation_file, (full_width, full_height),
+                                                                (width, height), flip_y_axis=flip_y_axis)
+    else:
+        label_image, annotation_map = None, None
+
+    return TissueTagAnnotation(image=im, ppm=ppm_anno, label_image=label_image, annotation_map=annotation_map, positions=df)
 
 def read_visium_hd(
     spaceranger_dir_path,
@@ -278,8 +308,10 @@ def read_visium_hd(
     ppm_out = None,
     mapped_image_path = None,
     in_tissue = True,
+    flip_y_axis = False,
+    annotation_file = None,
     plot = False,
-):
+) -> TissueTagAnnotation:
     """
     Reads 10X Visium HD data from SpaceRanger, including spatial image and metadata.
 
@@ -300,6 +332,10 @@ def read_visium_hd(
         set to 'mapped_res'.
     in_tissue : bool, optional
         Whether to include only tissue bins. Defaults to True.
+    flip_y_axis: bool, optional
+        Whether to flip the y-axis when loading in the image (default: False).
+    annotation_file: str, optional
+        Path to GeoJSON object containing annotation features. Expects GeoJSON object in the structure of QuPath GeoJSON output.
     plot : bool, optional
         Whether to plot the output image. Defaults to False.
 
@@ -356,28 +392,42 @@ def read_visium_hd(
 
     im = Image.open(image_files[use_resolution])
     ppm_anno = fullres_ppm * scalefactors[f"tissue_{use_resolution}_scalef"] if use_resolution != "mapped_res" else fullres_ppm # adjust resolution to the image
+    full_width, full_height = im.size
 
     # rescale image to target
     if ppm_out:
-        width, height = im.size
-        new_size = (int(width * ppm_out / ppm_anno), int(height * ppm_out / ppm_anno))
+        new_size = (int(full_width * ppm_out / ppm_anno), int(full_height * ppm_out / ppm_anno))
         im = im.resize(new_size, Image.Resampling.LANCZOS)
         ppm_anno = ppm_out
-
-    # Convert coordinates by the same scaling
-    df["pxl_col"] = df["pxl_col_in_fullres"] * ppm_anno
-    df["pxl_row"] = df["pxl_row_in_fullres"] * ppm_anno
 
     # Convert image to array
     im = im.convert("RGBA")
     im = np.array(im)
 
+    if flip_y_axis:
+        im = np.flipud(im)
+
+    # Convert coordinates by the same scaling
+    df["pxl_col"] = df["pxl_col_in_fullres"] * ppm_anno
+
+    if flip_y_axis:
+        df["pxl_row"] = (im.shape[0] - 1) - df["pxl_row_in_fullres"] * ppm_out
+    else:
+        df["pxl_row"] = df["pxl_row_in_fullres"] * ppm_anno
+
     # Call the plotting function if plot=True
     if plot:
         plot_10x_spatial_image(im, df, ppm_anno, int(bin_resolution), dpi=300, blowup_size_um=320, technology="VisiumHD", image_info="Image resolution: " + use_resolution)
 
-    return TissueTagAnnotation(image=im,ppm=ppm_anno,positions=df)
+    if annotation_file:
+        width, height = im.shape[:2]
+        label_image, annotation_map = import_geojson_annotation(annotation_file, (full_width, full_height),
+                                                                (width, height), flip_y_axis=flip_y_axis)
+    else:
+        label_image, annotation_map = None, None
 
+    return TissueTagAnnotation(image=im, ppm=ppm_anno, label_image=label_image, annotation_map=annotation_map,
+                               positions=df)
 
 def read_xenium(
     xeniumranger_dir_path,
@@ -386,8 +436,10 @@ def read_xenium(
     image_output = "fluorescence",
     fluorescence_channels = [0, 1, 2, 3],
     channel_colours = ["#0F73E6", "#F300A5", "#A4A400", "#008A00"],
+    flip_y_axis = False,
+    annotation_file = None,
     plot = False,
-):
+) -> TissueTagAnnotation:
     """
     Reads 10X Xenium data from XeniumRanger, including spatial image and metadata.
 
@@ -409,6 +461,10 @@ def read_xenium(
         List of channels to include in the virtual fluorescence image.
     channel_colours: str or list, optional
         Colours to use for the fluorescence channels. Can be set to "grayscale" or a list of 4 channel colours in hex format.
+    flip_y_axis: bool, optional
+        Whether to flip the y-axis when loading in the image (default: False).
+    annotation_file: str, optional
+        Path to GeoJSON object containing annotation features. Expects GeoJSON object in the structure of QuPath GeoJSON output.
     plot : bool, optional
         Whether to plot the output image. Defaults to False.
 
@@ -458,6 +514,8 @@ def read_xenium(
     pyramidal_ppm /= pyramidal_ppm[0]
     pyramidal_ppm *= fullres_ppm
 
+    full_width, full_height = im_meta.sizes["width"], im_meta.sizes["height"]
+
     # select pyramidal layer to load
     if ppm_out is None:
         ppm_out = fullres_ppm
@@ -476,7 +534,8 @@ def read_xenium(
         low_quantile, high_quantile = np.quantile(im, q=image_quantiles[0]), np.quantile(im, q=image_quantiles[1])
         im[im > high_quantile] = high_quantile
         im = ((im - low_quantile) / (high_quantile - low_quantile) * 255).astype(np.uint8)
-        im = np.flipud(im)
+        if flip_y_axis:
+            im = np.flipud(im)
 
         im = Image.fromarray(im).convert("L")
 
@@ -505,13 +564,24 @@ def read_xenium(
 
     # Convert coordinates by the same scaling
     df["pxl_col"] = df["x_centroid"] * ppm_out
-    df["pxl_row"] = (stacked_im.shape[0] - 1) - df["y_centroid"] * ppm_out
+
+    if flip_y_axis:
+        df["pxl_row"] = (stacked_im.shape[0] - 1) - df["y_centroid"] * ppm_out
+    else:
+        df["pxl_row"] = df["y_centroid"] * ppm_out
 
     # Call the plotting function if plot=True
     if plot:
         plot_10x_spatial_image(stacked_im, df, ppm_out, 0.5, dpi=300, blowup_size_um=320, technology="Xenium", image_info=f"Output type: {image_output}", blowup_marker_multiplier=6)
 
-    return TissueTagAnnotation(image=stacked_im,ppm=ppm_out,positions=df)
+    if annotation_file:
+        width, height = stacked_im.shape[:2]
+        label_image, annotation_map = import_geojson_annotation(annotation_file, (full_width, full_height), (width, height), flip_y_axis)
+    else:
+        label_image, annotation_map = None, None
+
+
+    return TissueTagAnnotation(image=stacked_im, ppm=ppm_out, label_image=label_image, annotation_map=annotation_map, positions=df)
 
 
 def simonson_vHE(dapi_image, eosin_image):
@@ -689,3 +759,89 @@ def plot_10x_spatial_image(
 
     plt.tight_layout()
     plt.show()
+
+
+def import_geojson_annotation(geojson_path, ori_shape, im_shape, sort_features=True, flip_y_axis=False):
+    """
+    Converts a GeoJSON FeatureCollection into a 2D matrix using ONLY rasterio.
+
+    Parameters
+    ----------
+    geojson_path : str
+        Path to GeoJSON object containing annotation features. Expects GeoJSON object in the structure of QuPath GeoJSON output.
+    ori_shape : tuple
+        Shape of the original image used in generating the GeoJSON annotation. Expect tuple of (width, height).
+    im_shape : tuple
+        Shape of the image stored in TissueTagAnnotation object. Expect tuple of (width, height).
+    sort_features : bool, optional
+        Whether to sort the features before overlaying the values to label image (default: True).
+        This is designed to deal with scenario where there are overlapping annotations.
+    flip_y_axis: bool, optional
+        Whether to flip the y-axis when loading in the image (default: False).
+
+
+    Returns
+    -------
+    np.array
+        Label image
+    dict
+        Annotation map
+    """
+
+    try:
+        import rasterio
+        from rasterio import features, transform
+    except ImportError as e:
+        raise ImportError("rasterio is needed for GeoJSON export.") from e
+
+    annotation_geometries = []
+
+    with open(geojson_path, "r") as f:
+        geojson_obj = json.load(f)
+
+    annotation_map = {}
+    for feature in geojson_obj['features']:
+        geom = feature['geometry']
+        props = feature.get('properties', {})
+
+        if geom.get("type") in ("Point", "MultiPoint", "LineString"):
+            continue
+
+        classification = props.get("classification", {})
+        feat_anno = classification.get("name", "Unclassified")
+        feat_colour = classification.get("color", [255,255,255])
+
+        annotation_map[feat_anno] = "#{0:02x}{1:02x}{2:02x}00".format(*feat_colour)
+
+        # Calculate bounding area
+        minx, miny, maxx, maxy = features.bounds(geom)
+        bounding_area = (maxx - minx) * (maxy - miny)
+
+        annotation_geometries.append({
+            'geom': geom,
+            'anno': feat_anno,
+            'area': bounding_area
+        })
+
+    if sort_features:
+        annotation_geometries.sort(key=lambda x: x['area'], reverse=True)
+
+    out_transform = transform.from_bounds(0, 0, ori_shape[0], ori_shape[1], im_shape[1], im_shape[0])
+
+    annotation_class = list(annotation_map.keys())
+    shapes_gen = ((item['geom'], annotation_class.index(item['anno'])+1) for item in annotation_geometries)
+
+    label_image = features.rasterize(
+        shapes=shapes_gen,
+        out_shape=im_shape,
+        transform=out_transform,
+        fill=0,
+        all_touched=True,
+        dtype=np.uint8
+    )
+    print(label_image.shape)
+
+    if not flip_y_axis:
+        label_image = np.flipud(label_image)
+
+    return label_image, annotation_map
