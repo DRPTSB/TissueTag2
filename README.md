@@ -4,7 +4,7 @@
 	<img src="https://github.com/nadavyayon/TissueTag/blob/main/tissueTag_logo.png" width="300">
 </p>
 
-# TissueTag: Jupyter Image Annotator - oa branch
+# TissueTag: Jupyter Image Annotator - oa branch - check
 
 TissueTag consists of two major components:
 1) **Jupyter-based image annotation tool**:Utilising the Bokeh Python library (http://www.bokeh.pydata.org) empowered by Datashader (https://datashader.org/index.html) and holoviews (https://holoviews.org/index.html) for pyramidal image rendering. This tool offers a streamlined annotation solution with subpixel resolution for quick interactive annotation of various image types (e.g., brightfield, fluorescence). TissueTag produces labelled images* (e.g., cortex, medulla) and logs all tissue labels, and annotation resolution and colours for reproducibility.
