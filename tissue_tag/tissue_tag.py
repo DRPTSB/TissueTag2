@@ -366,7 +366,6 @@ def bin_axis(ct_order, cutoff_values, df, axis_anno_name):
     print(ct_order[-1] + '= (' + str(cutoff_values[-1]) + '=<' + axis_anno_name + ')')
 
     df['manual_bin_' + axis_anno_name] = df['manual_bin_' + axis_anno_name].astype('category')
-    df['manual_bin_' + axis_anno_name + '_int'] = df['manual_bin_' + axis_anno_name].cat.codes
 
     return df
 
