@@ -12,7 +12,7 @@ import scipy.ndimage
 from scipy.spatial import cKDTree
 
 Image.MAX_IMAGE_PIXELS = None
-
+print('TissueTag oa')
 
 def generate_hires_grid(im, spot_to_spot, pixels_per_micron):
     """
