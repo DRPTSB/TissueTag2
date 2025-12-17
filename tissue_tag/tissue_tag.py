@@ -10,9 +10,193 @@ import skimage.transform
 import skimage.draw
 import scipy.ndimage
 from scipy.spatial import cKDTree
+from tissue_tag import io
 
 Image.MAX_IMAGE_PIXELS = None
 print('TissueTag oa')
+
+# gpt asisted, reviewed and corrected by nadav
+
+from typing import Tuple, List
+
+
+def run_tissuetag_visium_distance_pipeline(
+    adata,
+    tt_annotations_path: str,
+    grid_unit_size: float,      # µm between grid points
+    nhood_size: int,            # K for mean KNN distance
+    annotation_col: str = "annotation",
+    max_distance_microns: float | None = None,
+    drop_unassigned: bool = True,
+    plot: bool = True,
+) -> Tuple:
+    """
+    Run the TissueTag → Visium distance-mapping pipeline.
+
+    Loads a TissueTag annotation file, generates a micron-scale grid,
+    computes per-annotation KNN distances, maps them to Visium/Visium-HD
+    coordinates, and appends distance features to adata.obs.
+
+    Feature columns are named like:
+        L2_dist_annotation_white_matter__g15_k10
+    or:
+        L2_dist__white_matter__g15_k10
+
+    Returns
+    -------
+    (adata, grid_df, mapped_df, added_columns)
+    """
+
+    # ---- 0) Load TissueTag annotation object
+    tt_obj = io.load_annotation(file_path=tt_annotations_path)
+
+    # ---- 1) Generate grid in MICRONS (ppm_out=1 → 1 px/µm)
+    grid_df = generate_grid_from_annotation(
+        tt_obj,
+        spot_to_spot=grid_unit_size,
+        ppm_out=1,
+        annotation_column=annotation_col,
+    )
+
+    if drop_unassigned and annotation_col in grid_df.columns:
+        grid_df = grid_df[grid_df[annotation_col] != "unassigned"].copy()
+
+    # ---- 2) Compute per-annotation distances (micron scale)
+    calculate_distance_to_annotations(
+        grid_df,
+        knn=nhood_size,
+        annotation_column=annotation_col,
+        copy=False,
+    )
+
+    # ---- 3) Automatically detect Visium library and resolution
+    spatial_meta = adata.uns.get("spatial", {})
+    if not spatial_meta:
+        raise KeyError(
+            "adata.uns['spatial'] missing — this pipeline expects Visium/Visium-HD format."
+        )
+
+    # Get first (and usually only) library ID automatically
+    library_id = next(iter(spatial_meta.keys()))
+    microns_per_pixel = spatial_meta[library_id]["scalefactors"]["microns_per_pixel"]
+    ppm_target = 1.0 / microns_per_pixel  # pixels per micron
+
+    # ---- 4) Target coordinates (pixels)
+    target_df = pd.DataFrame(
+        adata.obsm["spatial"], index=adata.obs_names, columns=["x", "y"]
+    )
+
+    # ---- 5) Map microns → pixels
+    if max_distance_microns is None:
+        max_distance_microns = 3.0 * grid_unit_size
+
+    mapped_df = map_annotations_to_target(
+        df_source=grid_df,
+        df_target=target_df,
+        ppm_source=1.0,         # grid in microns
+        ppm_target=ppm_target,  # Visium pixels per micron
+        plot=plot,
+        max_distance=max_distance_microns,  # microns
+    )
+
+    # ---- 6) Rename distance columns to include __g{grid}_k{knn}
+    def _rename_dist_cols(df: pd.DataFrame, annotation_col: str, g: float, k: int):
+        suffix = f"_g{int(round(g))}_k{int(k)}"
+        prefixes = [f"L2_dist_{annotation_col}_", "L2_dist_"]
+        rename_map = {
+            c: c + suffix for c in df.columns if any(c.startswith(p) for p in prefixes)
+        }
+        return df.rename(columns=rename_map)
+
+    mapped_df = _rename_dist_cols(mapped_df, annotation_col, grid_unit_size, nhood_size)
+
+    # ---- 7) Append/overwrite distance features (renamed) in adata.obs
+    prefix_candidates = [f"L2_dist_{annotation_col}_", "L2_dist_"]
+    dist_cols = [c for c in mapped_df.columns if any(c.startswith(p) for p in prefix_candidates)]
+
+    # Align indices once
+    mapped_df = mapped_df.loc[adata.obs.index, dist_cols]
+
+    # Track which columns are being overwritten vs newly created
+    existing = [c for c in dist_cols if c in adata.obs.columns]
+    new      = [c for c in dist_cols if c not in adata.obs.columns]
+
+    # Overwrite (and create) in one shot
+    adata.obs[dist_cols] = mapped_df[dist_cols]
+
+    # Optional: return both lists so you know what happened
+    return adata, grid_df, mapped_df, {"overwritten": existing, "added": new}
+
+# Aux function assign annotation to paired anndata (can be bin2cell object, 2,8,16um binned data etc)
+# gpt asisted, reviewed and corrected by nadav
+
+
+def assign_annotation_label_to_anndata(
+    tissue_tag_annotation,
+    adata,
+    spatial_xy,
+    mapping_scalefactor: float,
+    annotation_name: str = "annotation",
+):
+    """
+    Map labels from `tissue_tag_annotation.label_image` to names defined by the
+    insertion order of `tissue_tag_annotation.annotation_map` (name->color).
+    Assumes:
+      - label_id 1..K correspond to the K keys in annotation_map (in order)
+      - label_id 0 is background → 'unassigned' if present else 'Unknown'
+    """
+    # --- validations ---
+    label_img = getattr(tissue_tag_annotation, "label_image", None)
+    if label_img is None:
+        raise ValueError("Label image is missing. Please annotate the image first.")
+    amap = getattr(tissue_tag_annotation, "annotation_map", None)
+    if not isinstance(amap, dict) or len(amap) == 0:
+        raise ValueError("annotation_map must be a non-empty dict of {name: color}.")
+    H, W = label_img.shape[:2]
+
+    spatial_xy = np.asarray(spatial_xy, dtype=float)
+    if spatial_xy.ndim != 2 or spatial_xy.shape[1] != 2:
+        raise ValueError("`spatial_xy` must be (N, 2) array of XY coordinates.")
+    # if spatial_xy.shape[0] != adata.n_obs:
+        # raise ValueError(f"`spatial_xy` length {spatial_xy.shape[0]} != adata.n_obs {adata.n_obs}.")
+    # if not np.isfinite(mapping_scalefactor) or mapping_scalefactor == 0:
+        # raise ValueError("`mapping_scalefactor` must be a finite, non-zero float.")
+
+    class_names_in_order = list(amap.keys())  
+    label_to_name = {i+1: name for i, name in enumerate(class_names_in_order)}
+    # background (0)
+    if "unassigned" in amap:
+        label_to_name[0] = "unassigned"
+    else:
+        label_to_name[0] = "Unknown"
+
+
+    # scale coords
+    scaled = spatial_xy / float(mapping_scalefactor)
+    y = np.rint(scaled[:, 0]).astype(int)  # y
+    x = np.rint(scaled[:, 1]).astype(int)  # x 
+
+    # --- explicit bounds check instead of clipping ---
+    # if np.any(x < 0) or np.any(x >= H) or np.any(y < 0) or np.any(y >= W):
+        # raise ValueError(
+            # "Some spatial_xy coordinates map outside the label image bounds. "
+            # f"x range [0,{H-1}], y range [0,{W-1}]. "
+            # f"Got x in [{x.min()},{x.max()}], cols in [{y.min()},{y.max()}]."
+        # )
+
+
+    label_ids = label_img[x, y] # mapping 
+
+    # --- map labels to names ---
+    names = pd.Series(label_ids).map(lambda lid: label_to_name.get(int(lid), "Unknown"))
+
+    # make categorical with stable, useful order: unassigned first (if present), then others
+    categories = [c for c in ["unassigned"] if c in set(names)] + \
+                 [n for n in class_names_in_order if n != "unassigned" and n in set(names)]
+    adata.obs[annotation_name] = pd.Categorical(names, categories=categories, ordered=True)
+
+    return adata
+
 
 
 def calculate_axis(df, cols, output_col, w=[1]):
