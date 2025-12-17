@@ -14,6 +14,48 @@ from scipy.spatial import cKDTree
 Image.MAX_IMAGE_PIXELS = None
 print('TissueTag oa')
 
+
+def calculate_axis(df, cols, output_col, w=[1]):
+    """
+    Calculate a unimodal normalized axis based on 2 or 3 ordered columns.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Input DataFrame containing the data.
+    cols : list of str
+        Ordered list of full column names.
+        - len(cols) == 2 → simple 2-point axis (S1 -> S2)
+        - len(cols) == 3 → 3-point axis (S1 -> S2 -> S3)
+    output_col : str
+        Name of the output column to store the calculated axis.
+    w : list of float, optional
+        Weights for the 3-point axis [w0, w1]. Default [1].
+
+    Returns
+    -------
+    pd.DataFrame
+        DataFrame with the calculated axis column.
+    """
+    df = df.copy()
+
+    if len(cols) == 2:
+        a1 = (df[cols[0]] - df[cols[1]]) / (df[cols[0]] + df[cols[1]])
+        df[output_col] = a1
+        return df
+
+    elif len(cols) == 3:
+        if len(w) != 2:
+            raise ValueError("For 3-point axis, provide two weights: [w0, w1].")
+
+        a1 = (df[cols[0]] - df[cols[1]]) / (df[cols[0]] + df[cols[1]])
+        a2 = (df[cols[1]] - df[cols[2]]) / (df[cols[1]] + df[cols[2]])
+        df[output_col] = w[0] * a1 + w[1] * a2
+        return df
+
+    else:
+        raise ValueError("`cols` must have length 2 or 3.")
+
 def generate_hires_grid(im, spot_to_spot, pixels_per_micron):
     """
     Creates a hexagonal grid of a specified size and density.
