@@ -1,2 +1,2 @@
-from .tissue_tag import *
+from .organaxis import *
 from .io import *
