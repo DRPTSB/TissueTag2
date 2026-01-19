@@ -23,7 +23,7 @@ def run_tissuetag_visium_distance_pipeline(
     max_distance = None,
     drop_unassigned = True,
     plot = True,
-    copy = False
+    copy_adata = False
 ):
     """
     Run Visium distance-mapping pipeline which are composed of the following steps:
@@ -56,7 +56,7 @@ def run_tissuetag_visium_distance_pipeline(
         Ignore entries which have no annotation (i.e. unassigned). Default is True.
     plot : bool, optional
         If True, plots the coordinates of the grid space and the spot space to verify alignment. Default is True.
-    copy : bool, optional
+    copy_adata : bool, optional
         Return a new copy of the anndata object instead of modifying it in place. Default is False.
 
     Returns
@@ -70,7 +70,7 @@ def run_tissuetag_visium_distance_pipeline(
     dict
         Dictionary object containing a list of overwritten column(s) and newly added column(s) in anndata.obs.
     """
-    adata = adata.copy() if copy else adata
+    adata = adata.copy() if copy_adata else adata
 
     if 'spatial' not in adata.uns:
         raise KeyError("Spatial information is missing from anndata object. "
@@ -89,11 +89,10 @@ def run_tissuetag_visium_distance_pipeline(
         grid_df = grid_df[grid_df[annotation_column] != "unassigned"]
 
     # Compute per-annotation distances (micron scale)
-    calculate_distance_to_annotations(
+    grid_df = calculate_distance_to_annotations(
         grid_df,
         knn=knn,
-        annotation_column=annotation_column,
-        copy=False
+        annotation_column=annotation_column
     )
 
     # Get resolution of the Visium/Visium HD library
@@ -109,13 +108,12 @@ def run_tissuetag_visium_distance_pipeline(
         max_distance = 3.0 * grid_unit_size
 
     mapped_df = map_annotations_to_target(
-        source_df=grid_df,
-        target_df=target_df,
+        df_target=target_df,
+        df_source=grid_df,
         ppm_source=1.0,         # grid in microns
         ppm_target=ppm_target,  # Visium pixels per micron
         plot=plot,
         max_distance=max_distance,  # microns
-        copy=True
     )
 
     # Align index to anndata and extract distance columns only
@@ -169,7 +167,7 @@ def get_annotations_for_objects(tissue_tag_annotation, coord_df):
     return vectorized_map(annotation_ids)
 
 
-def calculate_axis(feature_df, feature_columns, output_column, weights=(0.2, 0.8), copy=False):
+def calculate_axis(feature_df, feature_columns, output_column, weights=(0.2, 0.8)):
     """
     Calculate a unimodal normalized axis based on 2 or 3 ordered features.
 
@@ -189,11 +187,11 @@ def calculate_axis(feature_df, feature_columns, output_column, weights=(0.2, 0.8
 
     Returns
     -------
-    None | pandas.DataFrame
-        DataFrame with the calculated axis column if copy is True, otherwise None.
+    pandas.DataFrame
+        DataFrame with the calculated axis column.
     """
 
-    feature_df = feature_df.copy() if copy else feature_df
+    feature_df = feature_df.copy()
 
     if not 2 <= len(feature_columns) <= 3:
         raise ValueError("Please specify either 2 or 3 feature columns to calculate 2 or 3 point axis.")
@@ -210,7 +208,7 @@ def calculate_axis(feature_df, feature_columns, output_column, weights=(0.2, 0.8
         axis2 = (feature_df[feature_columns[1]] - feature_df[feature_columns[2]]) / (feature_df[feature_columns[1]] + feature_df[feature_columns[2]])
         feature_df[output_column] = weights[0] * axis1 + weights[1] * axis2
 
-    return feature_df if copy else None
+    return feature_df
 
 
 def generate_hires_grid(im, grid_unit_size, pixels_per_micron):
@@ -330,7 +328,7 @@ def generate_grid_from_annotation(tissue_tag_annotation, grid_unit_size, ppm_out
     return df
 
 
-def map_annotations_to_target(target_df, source_df, ppm_target, ppm_source=1, plot=True, max_distance=50.0, copy=False):
+def map_annotations_to_target(df_source, df_target, ppm_target, ppm_source=1.0, plot=True, max_distance=50.0):
     """
     Map annotations from source df with grid and annotation data to target df based on nearest
     neighbor matching within a maximum distance.
@@ -338,31 +336,30 @@ def map_annotations_to_target(target_df, source_df, ppm_target, ppm_source=1, pl
     Parameters
     ----------
 
-    target_df : pandas.DataFrame
-        DataFrame with target data.
-    source_df : pandas.DataFrame
+    df_source : pandas.DataFrame
         DataFrame with grid data and annotations.
-    ppm_source : float
-        Pixels per micron of source data.
+    df_target : pandas.DataFrame
+        DataFrame with target data.
     ppm_target : float
         Pixels per micron of target data.
+    ppm_source : float, optional
+        Pixels per micron of source data. Default to 1.0.
     plot : bool, optional
         If True, plots the coordinates of the grid space and the spot space to verify alignment. Default is True.
-    max_distance : float
+    max_distance : float, optional
         Maximum allowable distance for matching points. Final max_distance used will be max_distance * ppm_target.
-    copy : bool, optional
-        Return a new copy of the df_target with the columns from df_source instead of modifying it in place.
-        Default is False.
+        Default to 50.0.
+
 
     Returns
     -------
-    None | pandas.DataFrame
-        Target DataFrame with additional annotations from the source dataframe if copy is True, otherwise None.
+    pandas.DataFrame
+        Target DataFrame with additional annotations from the source dataframe.
     """
 
     # Adjust coordinate scaling
-    a = np.vstack([source_df['x'] / ppm_source, source_df['y'] / ppm_source]).T
-    b = np.vstack([target_df['x'] / ppm_target, target_df['y'] / ppm_target]).T
+    a = np.vstack([df_source['x'] / ppm_source, df_source['y'] / ppm_source]).T
+    b = np.vstack([df_target['x'] / ppm_target, df_target['y'] / ppm_target]).T
 
     # Plot the coordinate spaces if requested, overlaying them in a single plot with different colors and a legend
     if plot:
@@ -380,27 +377,27 @@ def map_annotations_to_target(target_df, source_df, ppm_target, ppm_source=1, pl
     distances, indices = tree.query(b, distance_upper_bound=max_distance * ppm_target)
 
     # Filter valid indices based on distance and within-bounds check
-    valid_mask = (indices < len(source_df)) & (distances < max_distance * ppm_target)
+    valid_mask = (indices < len(df_source)) & (distances < max_distance * ppm_target)
 
-    target_df = target_df.copy() if copy else target_df
+    df_target = df_target.copy()
 
     # For each annotation, assign the value from the nearest neighbor in the source data
-    annotations = source_df.columns.difference(['x', 'y'])
+    annotations = df_source.columns.difference(['x', 'y'])
     for k in annotations:
         # Initialize with NaN or None where indices are out of bounds
-        if pd.api.types.is_numeric_dtype(source_df[k]):
-            target_df[k] = np.nan
+        if pd.api.types.is_numeric_dtype(df_source[k]):
+            df_target[k] = np.nan
         else:
-            target_df[k] = None
+            df_target[k] = None
 
         # Assign values where distance criteria are met and indices are valid
         valid_indices = indices[valid_mask]
-        target_df.loc[valid_mask, k] = source_df.iloc[valid_indices][k].values
+        df_target.loc[valid_mask, k] = df_source.iloc[valid_indices][k].values
 
-    return target_df
+    return df_target
 
 
-def calculate_distance_to_annotations(grid_df, knn=5, logscale=False, annotation_column='annotation', copy=False):
+def calculate_distance_to_annotations(grid_df, knn=5, logscale=False, annotation_column='annotation'):
     """
     Calculate the nearest distance for each grid points to all annotation categories.
 
@@ -414,17 +411,14 @@ def calculate_distance_to_annotations(grid_df, knn=5, logscale=False, annotation
         Use logarithmic scale (base 10) for distances. Default is False.
     annotation_column : str, optional
         Column name for the annotation values within the grid dataframe. Default is 'annotation'.
-    copy : bool, optional
-        Return a new copy of the grid with the distance instead of modifying it in place. Default is False.
 
     Returns
     -------
-    None | pandas.DataFrame
-        DataFrame containing the grid coordinates and distances to each annotation category if copy is True,
-        otherwise None.
+    pandas.DataFrame
+        DataFrame containing the grid coordinates and distances to each annotation category.
     """
 
-    grid_df = grid_df.copy() if copy else grid_df
+    grid_df = grid_df.copy()
     print('calculating distance matrix')
 
     points = np.vstack([grid_df['x'], grid_df['y']]).T
@@ -454,10 +448,10 @@ def calculate_distance_to_annotations(grid_df, knn=5, logscale=False, annotation
 
     print(dist_to_annotations)
 
-    return grid_df if copy else None
+    return grid_df
 
 
-def bin_axis(axis_df, axis_column, bin_labels, cutoff_values, copy=False):
+def bin_axis(axis_df, axis_column, bin_labels, cutoff_values):
     """
     Bins a column of a DataFrame based on cutoff values and assigns manual bin labels.
 
@@ -471,19 +465,17 @@ def bin_axis(axis_df, axis_column, bin_labels, cutoff_values, copy=False):
         The order of manual bin labels.
     cutoff_values : list of float
         The cutoff values used for binning.
-    copy : bool, optional
-        Return a new copy of the grid with the distance instead of modifying it in place. Default is False.
 
     Returns
     -------
-    None | pandas.DataFrame
-        DataFrame with binned axis if copy is True, otherwise None.
+    pandas.DataFrame
+        DataFrame with binned axis.
     """
 
     if len(bin_labels) != (len(cutoff_values) + 1):
         raise ValueError("The number of bin labels and cutoff values are not compatible.")
 
-    axis_df = axis_df.copy() if copy else axis_df
+    axis_df = axis_df.copy()
 
     # Initialize binned column with 'unassigned'
     binned_col = f'binned_{axis_column}'
@@ -501,7 +493,7 @@ def bin_axis(axis_df, axis_column, bin_labels, cutoff_values, copy=False):
     axis_df.loc[axis_df[axis_column] >= cutoff_values[-1], binned_col] = bin_labels[-1]
     print(f"{bin_labels[-1]} = ({axis_column} >= {cutoff_values[-1]})")
 
-    return axis_df if copy else None
+    return axis_df
 
 
 def plot_cont(df, x_col, y_col, color_col, cmap='jet', title='L2_distance_plot', s=1, dpi=100, figsize=(10, 10)):
