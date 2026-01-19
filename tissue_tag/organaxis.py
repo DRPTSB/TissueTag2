@@ -109,8 +109,8 @@ def run_tissuetag_visium_distance_pipeline(
         max_distance = 3.0 * grid_unit_size
 
     mapped_df = map_annotations_to_target(
-        df_source=grid_df,
-        df_target=target_df,
+        source_df=grid_df,
+        target_df=target_df,
         ppm_source=1.0,         # grid in microns
         ppm_target=ppm_target,  # Visium pixels per micron
         plot=plot,
@@ -136,9 +136,9 @@ def run_tissuetag_visium_distance_pipeline(
     return adata, grid_df, mapped_df, {"overwritten": existing, "added": new}
 
 
-def assign_annotation_label_to_object(tissue_tag_annotation, coord_df):
+def get_annotations_for_objects(tissue_tag_annotation, coord_df):
     """
-    Assign annotation to objects based on their coordinate.
+    Retrieve annotation labels for objects based on their spatial coordinates.
 
     Parameters
     ----------
@@ -149,8 +149,8 @@ def assign_annotation_label_to_object(tissue_tag_annotation, coord_df):
 
     Returns
     -------
-    pandas.Series
-        Series object containing annotation for each object in coord_df
+    numpy.ndarray
+        Array of string labels corresponding to each row in coord_df.
     """
 
     if tissue_tag_annotation.label_image is None:
@@ -164,9 +164,9 @@ def assign_annotation_label_to_object(tissue_tag_annotation, coord_df):
 
     annotation_label_mapping = {i + 1: v for i, v in enumerate(tissue_tag_annotation.annotation_map.keys())}
     annotation_ids = tissue_tag_annotation.label_image[np.rint(coord_df["x"]).astype(int), np.rint(coord_df["y"]).astype(int)]
-    annotation_labels = pd.Series(annotation_ids).map(lambda annotation_id: annotation_label_mapping.get(annotation_id, "Unknown"))
+    vectorized_map = np.vectorize(lambda x: annotation_label_mapping.get(x, "Unknown"), otypes=[object])
 
-    return annotation_labels.values
+    return vectorized_map(annotation_ids)
 
 
 def calculate_axis(feature_df, feature_columns, output_column, weights=(0.2, 0.8), copy=False):
@@ -330,16 +330,18 @@ def generate_grid_from_annotation(tissue_tag_annotation, grid_unit_size, ppm_out
     return df
 
 
-def map_annotations_to_target(df_source, df_target, ppm_target, ppm_source=1, plot=True, max_distance=50.0, copy=False):
+def map_annotations_to_target(target_df, source_df, ppm_target, ppm_source=1, plot=True, max_distance=50.0, copy=False):
     """
-    Map annotations from a source to a target DataFrame based on nearest neighbor matching within a maximum distance.
+    Map annotations from source df with grid and annotation data to target df based on nearest
+    neighbor matching within a maximum distance.
 
     Parameters
     ----------
-    df_source : pandas.DataFrame
-        DataFrame with grid data and annotations.
-    df_target : pandas.DataFrame
+
+    target_df : pandas.DataFrame
         DataFrame with target data.
+    source_df : pandas.DataFrame
+        DataFrame with grid data and annotations.
     ppm_source : float
         Pixels per micron of source data.
     ppm_target : float
@@ -355,12 +357,12 @@ def map_annotations_to_target(df_source, df_target, ppm_target, ppm_source=1, pl
     Returns
     -------
     None | pandas.DataFrame
-        DataFrame with additional annotations from the source dataframe if copy is True, otherwise None.
+        Target DataFrame with additional annotations from the source dataframe if copy is True, otherwise None.
     """
 
     # Adjust coordinate scaling
-    a = np.vstack([df_source['x'] / ppm_source, df_source['y'] / ppm_source]).T
-    b = np.vstack([df_target['x'] / ppm_target, df_target['y'] / ppm_target]).T
+    a = np.vstack([source_df['x'] / ppm_source, source_df['y'] / ppm_source]).T
+    b = np.vstack([target_df['x'] / ppm_target, target_df['y'] / ppm_target]).T
 
     # Plot the coordinate spaces if requested, overlaying them in a single plot with different colors and a legend
     if plot:
@@ -378,29 +380,29 @@ def map_annotations_to_target(df_source, df_target, ppm_target, ppm_source=1, pl
     distances, indices = tree.query(b, distance_upper_bound=max_distance * ppm_target)
 
     # Filter valid indices based on distance and within-bounds check
-    valid_mask = (indices < len(df_source)) & (distances < max_distance * ppm_target)
+    valid_mask = (indices < len(source_df)) & (distances < max_distance * ppm_target)
 
-    df_target = df_target.copy() if copy else df_target
+    target_df = target_df.copy() if copy else target_df
 
     # For each annotation, assign the value from the nearest neighbor in the source data
-    annotations = df_source.columns.difference(['x', 'y'])
+    annotations = source_df.columns.difference(['x', 'y'])
     for k in annotations:
         # Initialize with NaN or None where indices are out of bounds
-        if pd.api.types.is_numeric_dtype(df_source[k]):
-            df_target[k] = np.nan
+        if pd.api.types.is_numeric_dtype(source_df[k]):
+            target_df[k] = np.nan
         else:
-            df_target[k] = None
+            target_df[k] = None
 
         # Assign values where distance criteria are met and indices are valid
         valid_indices = indices[valid_mask]
-        df_target.loc[valid_mask, k] = df_source.iloc[valid_indices][k].values
+        target_df.loc[valid_mask, k] = source_df.iloc[valid_indices][k].values
 
-    return df_target
+    return target_df
 
 
 def calculate_distance_to_annotations(grid_df, knn=5, logscale=False, annotation_column='annotation', copy=False):
     """
-    Calculate the nearest distance for each grid points to all annotation categories..
+    Calculate the nearest distance for each grid points to all annotation categories.
 
     Parameters
     ----------
@@ -455,7 +457,6 @@ def calculate_distance_to_annotations(grid_df, knn=5, logscale=False, annotation
     return grid_df if copy else None
 
 
-# REMOVE OR UPDATE
 def bin_axis(axis_df, axis_column, bin_labels, cutoff_values, copy=False):
     """
     Bins a column of a DataFrame based on cutoff values and assigns manual bin labels.
