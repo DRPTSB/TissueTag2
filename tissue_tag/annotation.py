@@ -30,6 +30,7 @@ from scanpy.preprocessing import normalize_total
 from tinybrain import downsample_segmentation
 
 from tissue_tag.io import TissueTagAnnotation
+from tissue_tag.organaxis import get_annotations_for_objects
 
 hv.extension('bokeh')
 
@@ -1054,13 +1055,8 @@ def assign_annotation_label_to_positions(tissue_tag_annotation, annotation_colum
 
     tissue_tag_annotation = cp.deepcopy(tissue_tag_annotation) if copy else tissue_tag_annotation
 
-    annotation_label_list = {i + 1: v for i, v in enumerate(tissue_tag_annotation.annotation_map.keys())}
-
-    def get_annotation(row):
-        annotation_id = tissue_tag_annotation.label_image[int(np.round(row["pxl_row"])), int(np.round(row["pxl_col"]))]
-        return annotation_label_list.get(annotation_id, "Unknown")
-
-    tissue_tag_annotation.positions[annotation_column] = tissue_tag_annotation.positions.apply(get_annotation, 1)
+    coord_df = tissue_tag_annotation.positions[["pxl_row", "pxl_col"]].rename(columns={"pxl_row":"x", "pxl_col":"y"})
+    tissue_tag_annotation.positions[annotation_column] = get_annotations_for_objects(tissue_tag_annotation, coord_df)
 
     return tissue_tag_annotation if copy else None
 
