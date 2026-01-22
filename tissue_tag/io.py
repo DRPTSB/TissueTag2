@@ -18,14 +18,12 @@ import tifffile
 @dataclass
 class TissueTagAnnotation:
     image: np.array
-    source_ppm: float
     ppm: float
     label_image: Optional[np.array] = None
     # Note that value 0 in label_image is a special value to indicate no annotation has been assigned
     annotation_map: Optional[dict] = None
     positions: Optional[pd.DataFrame] = None
     grid: Optional[pd.DataFrame] = None
-    version: float = 1.1
 
     def save_annotation(self, file_path):
         """
@@ -40,14 +38,11 @@ class TissueTagAnnotation:
             if self.image is not None:
                 f.create_dataset('image', data=self.image)
             if self.ppm is not None:
-                f.create_dataset('source_ppm', data=self.source_ppm)
-            if self.ppm is not None:
                 f.create_dataset('ppm', data=self.ppm)
             if self.label_image is not None:
                 f.create_dataset('label_image', data=self.label_image)
             if self.annotation_map is not None:
                 f.create_dataset('annotation_map', data=json.dumps(self.annotation_map))
-            f.create_dataset("version", data=self.version)
         if self.positions is not None:
             self.positions.to_hdf(file_path, key="positions", mode="a")
         if self.grid is not None:
@@ -70,7 +65,6 @@ def load_annotation(file_path):
     """
     with h5py.File(file_path, 'r') as f:
         image = f['image'][:] if 'image' in f else None
-        source_ppm = f['source_ppm'][()] if 'source_ppm' in f else None
         ppm = f['ppm'][()] if 'ppm' in f else None
         label_image = f['label_image'][:] if 'label_image' in f else None
         annotation_map = json.loads(f['annotation_map'][()]) if 'annotation_map' in f else None
@@ -80,50 +74,20 @@ def load_annotation(file_path):
         grid = None
         if 'grid' in f:
             grid = pd.read_hdf(file_path, key="grid")
-        version = f['version'][()] if 'version' in f else None
 
-    if version < TissueTagAnnotation.version:
-        print(f'> Loading an older version of TissueTagAnnotation object...')
-
-    empty_attributes = []
     if image is not None:
         print(f'> loaded image - size - {str(image.shape)}')
-    else:
-        empty_attributes.append("image")
-    if source_ppm is not None:
-        print(f'> loaded source ppm: {source_ppm}')
-    else:
-        empty_attributes.append("source_ppm")
     if ppm is not None:
         print(f'> loaded ppm: {ppm}')
-    else:
-        empty_attributes.append("ppm")
     if label_image is not None:
         print(f'> loaded label image - size - {str(label_image.shape)}')
-    else:
-        empty_attributes.append("label_image")
     if annotation_map is not None:
-        if version < TissueTagAnnotation.version:
-            print(f'> Updating annotation map structure:')
-            updated_annotation_map = {}
-            for i, category in enumerate(annotation_map.keys()):
-                updated_annotation_map[i] = {"category": category, "colour": annotation_map[category]}
-            annotation_map = updated_annotation_map
-        else:
-            print(f'> loaded annotation map:')
+        print(f'> loaded annotation map:')
         print(annotation_map)
-    else:
-        empty_attributes.append("annotation_map")
     if positions is not None:
         print('> loaded positions')
-    else:
-        empty_attributes.append("positions")
     if grid is not None:
         print('> loaded grid')
-    else:
-        empty_attributes.append("grid")
-    print(f"Empty or missing attributes: {empty_attributes.join(', ')}")
-
     return TissueTagAnnotation(image, ppm, label_image, annotation_map, positions, grid)
 
 
@@ -175,7 +139,7 @@ def read_image(
             ppm_image = im.info['resolution'][0]
             print('found ppm in image metadata!, its - '+str(ppm_image))
         except:
-            raise ValueError('Could not find ppm in image metadata, please provide ppm value')
+            print('could not find ppm in image metadata, please provide ppm value')
     full_width, full_height = im.size
     newsize = (int(full_width/ppm_image*ppm_out), int(full_height/ppm_image*ppm_out))
     # resize
@@ -215,7 +179,7 @@ def read_image(
     else:
         label_image, annotation_map = None, None
 
-    return TissueTagAnnotation(image=im, source_ppm=ppm_image, ppm=ppm_out, label_image=label_image, annotation_map=annotation_map)
+    return TissueTagAnnotation(image=im, ppm=ppm_out, label_image=label_image, annotation_map=annotation_map)
 
 
 def read_visium(
@@ -310,7 +274,6 @@ def read_visium(
     im = Image.open(image_files[use_resolution])
     ppm_anno = fullres_ppm * scalefactors[f"tissue_{use_resolution}_scalef"] if use_resolution != "mapped_res" else fullres_ppm # adjust resolution to the image
     full_width, full_height = im.size
-    source_ppm = ppm_anno
 
     # rescale image to target
     if ppm_out:
@@ -336,7 +299,7 @@ def read_visium(
     else:
         label_image, annotation_map = None, None
 
-    return TissueTagAnnotation(image=im, source_ppm=source_ppm, ppm=ppm_anno, label_image=label_image, annotation_map=annotation_map, positions=df)
+    return TissueTagAnnotation(image=im, ppm=ppm_anno, label_image=label_image, annotation_map=annotation_map, positions=df)
 
 def read_visium_hd(
     spaceranger_dir_path,
@@ -430,7 +393,6 @@ def read_visium_hd(
     im = Image.open(image_files[use_resolution])
     ppm_anno = fullres_ppm * scalefactors[f"tissue_{use_resolution}_scalef"] if use_resolution != "mapped_res" else fullres_ppm # adjust resolution to the image
     full_width, full_height = im.size
-    source_ppm = ppm_anno
 
     # rescale image to target
     if ppm_out:
@@ -464,7 +426,7 @@ def read_visium_hd(
     else:
         label_image, annotation_map = None, None
 
-    return TissueTagAnnotation(image=im, source_ppm=source_ppm, ppm=ppm_anno, label_image=label_image, annotation_map=annotation_map,
+    return TissueTagAnnotation(image=im, ppm=ppm_anno, label_image=label_image, annotation_map=annotation_map,
                                positions=df)
 
 def read_xenium(
@@ -552,8 +514,6 @@ def read_xenium(
     pyramidal_ppm /= pyramidal_ppm[0]
     pyramidal_ppm *= fullres_ppm
 
-    # !TODO Figure out which is the source_ppm?
-
     full_width, full_height = im_meta.sizes["width"], im_meta.sizes["height"]
 
     # select pyramidal layer to load
@@ -621,7 +581,7 @@ def read_xenium(
         label_image, annotation_map = None, None
 
 
-    return TissueTagAnnotation(image=stacked_im, source_ppm=source_ppm, ppm=ppm_out, label_image=label_image, annotation_map=annotation_map, positions=df)
+    return TissueTagAnnotation(image=stacked_im, ppm=ppm_out, label_image=label_image, annotation_map=annotation_map, positions=df)
 
 
 def simonson_vHE(dapi_image, eosin_image):
@@ -840,7 +800,6 @@ def import_geojson_annotation(geojson_path, ori_shape, im_shape, sort_features=T
         geojson_obj = json.load(f)
 
     annotation_map = {}
-    annotation_id_map = {}
     for feature in geojson_obj['features']:
         geom = feature['geometry']
         props = feature.get('properties', {})
@@ -852,10 +811,7 @@ def import_geojson_annotation(geojson_path, ori_shape, im_shape, sort_features=T
         feat_anno = classification.get("name", "Unclassified")
         feat_colour = classification.get("color", [255,255,255])
 
-        if feat_anno not in annotation_id_map:
-            id = len(annotation_map)+1
-            annotation_map[id] =  {"category": feat_anno, "colour": "#{0:02x}{1:02x}{2:02x}".format(*feat_colour)}
-            annotation_id_map[feat_anno] = id
+        annotation_map[feat_anno] = "#{0:02x}{1:02x}{2:02x}00".format(*feat_colour)
 
         # Calculate bounding area
         minx, miny, maxx, maxy = features.bounds(geom)
@@ -872,7 +828,8 @@ def import_geojson_annotation(geojson_path, ori_shape, im_shape, sort_features=T
 
     out_transform = transform.from_bounds(0, 0, ori_shape[0], ori_shape[1], im_shape[1], im_shape[0])
 
-    shapes_gen = ((item['geom'], annotation_id_map[item['anno']]) for item in annotation_geometries)
+    annotation_class = list(annotation_map.keys())
+    shapes_gen = ((item['geom'], annotation_class.index(item['anno'])+1) for item in annotation_geometries)
 
     label_image = features.rasterize(
         shapes=shapes_gen,
