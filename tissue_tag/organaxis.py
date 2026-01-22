@@ -13,6 +13,9 @@ from scipy.spatial import cKDTree
 
 Image.MAX_IMAGE_PIXELS = None
 
+# Constants for numerical stability
+LOG_EPSILON = 1e-10  # Small value to prevent log(0) errors
+
 
 def run_tissuetag_visium_distance_pipeline(
     adata,
@@ -278,7 +281,7 @@ def generate_hires_grid(im, grid_unit_size, pixels_per_micron):
         
         return all_positions.T
     else:
-        return np.array([[], []]) # Return empty 2xN array
+        return np.array([[], []])  # Return empty 2xN array
 
 
 
@@ -481,7 +484,7 @@ def calculate_distance_to_annotations(grid_df, knn=5, logscale=False, annotation
 
     for c in categories:
         if logscale:
-            grid_df["L2_dist_log10_" + annotation_column + '_' + c] = np.log10(dist_to_annotations[c] + 1e-10)  # Add small epsilon to avoid log(0)
+            grid_df["L2_dist_log10_" + annotation_column + '_' + c] = np.log10(dist_to_annotations[c] + LOG_EPSILON)
         else:
             grid_df["L2_dist_" + annotation_column + '_' + c] = dist_to_annotations[c]
 
@@ -523,9 +526,10 @@ def bin_axis(axis_df, axis_column, bin_labels, cutoff_values):
     cutoff_array = np.array(cutoff_values)
     bin_indices = np.digitize(axis_df[axis_column], cutoff_array)
     
-    # Map bin indices to labels
-    axis_df[binned_col] = [bin_labels[i] if 0 <= i < len(bin_labels) else 'unassigned' 
-                           for i in bin_indices]
+    # Map bin indices to labels using vectorized numpy operations
+    axis_df[binned_col] = np.where((bin_indices >= 0) & (bin_indices < len(bin_labels)),
+                                    np.array(bin_labels)[bin_indices],
+                                    'unassigned')
     
     # Print bin definitions for reference
     print(f"{bin_labels[0]} = ({axis_column} < {cutoff_values[0]})")
