@@ -28,7 +28,7 @@ class TissueTagAnnotation:
     @property
     def version(self):
         """Version of the TissueTagAnnotation class."""
-        return "1.1"
+        return 1.1
 
     def save_annotation(self, file_path):
         """
@@ -46,9 +46,9 @@ class TissueTagAnnotation:
                 f.create_dataset('ppm', data=self.ppm)
             if self.label_image is not None:
                 f.create_dataset('label_image', data=self.label_image)
-            if self.annotation_map is not None:
-                # Save DataFrame as JSON with orient='split' to preserve index
-                f.create_dataset('annotation_map', data=json.dumps(self.annotation_map.to_dict(orient='split')))
+            f.create_dataset("version", data=self.version)
+        if self.annotation_map is not None:
+            self.annotation_map.to_hdf(file_path, key="annotation_map", mode="a")
         if self.positions is not None:
             self.positions.to_hdf(file_path, key="positions", mode="a")
         if self.grid is not None:
@@ -70,46 +70,48 @@ def load_annotation(file_path):
         The loaded TissueTagAnnotation object.
     """
     with h5py.File(file_path, 'r') as f:
-        image = f['image'][:] if 'image' in f else None
-        ppm = f['ppm'][()] if 'ppm' in f else None
-        label_image = f['label_image'][:] if 'label_image' in f else None
+        version = f['version'][()] if 'version' in f else 1.0
+        if version < TissueTagAnnotation.version:
+            print(f'> Loading an older version of TissueTagAnnotation object...')
+
+        if 'image' in f:
+            image = f['image'][:]
+            print(f'> loaded image - size - {str(image.shape)}')
+
+        if 'ppm' in f:
+            ppm = f['ppm'][()]
+            print(f'> loaded ppm: {ppm}')
+
+        if 'label_image' in f:
+            label_image = f['label_image'][:]
+            print(f'> loaded label image - size - {str(label_image.shape)}')
+
         annotation_map = None
         if 'annotation_map' in f:
             annotation_dict = json.loads(f['annotation_map'][()])
-            # Check if it's the old dict format or new DataFrame format
-            if isinstance(annotation_dict, dict) and 'columns' in annotation_dict and 'data' in annotation_dict:
-                # New DataFrame format (saved with to_dict(orient='split'))
-                annotation_map = pd.DataFrame(
-                    annotation_dict['data'],
-                    columns=annotation_dict['columns'],
-                    index=annotation_dict['index']
-                )
+            # Check if the saved object version is up to date
+            if version < TissueTagAnnotation.version:
+                annotation_map = pd.read_hdf(file_path, key="positions")
             else:
-                # Old dict format - convert to DataFrame
+                print(f'> Updating annotation map structure...')
                 annotation_map = pd.DataFrame([
                     {'annotation_id': i+1, 'annotation_label': label, 'annotation_colour': color}
                     for i, (label, color) in enumerate(annotation_dict.items())
-                ]).set_index('annotation_id')
+                ])
+
+            print(f'> loaded annotation map:')
+            print(annotation_map)
+
         positions = None
         if 'positions' in f:
             positions = pd.read_hdf(file_path, key="positions")
+            print('> loaded positions')
+
         grid = None
         if 'grid' in f:
             grid = pd.read_hdf(file_path, key="grid")
+            print('> loaded grid')
 
-    if image is not None:
-        print(f'> loaded image - size - {str(image.shape)}')
-    if ppm is not None:
-        print(f'> loaded ppm: {ppm}')
-    if label_image is not None:
-        print(f'> loaded label image - size - {str(label_image.shape)}')
-    if annotation_map is not None:
-        print(f'> loaded annotation map:')
-        print(annotation_map)
-    if positions is not None:
-        print('> loaded positions')
-    if grid is not None:
-        print('> loaded grid')
     return TissueTagAnnotation(image, ppm, label_image, annotation_map, positions, grid)
 
 
@@ -866,10 +868,9 @@ def import_geojson_annotation(geojson_path, ori_shape, im_shape, sort_features=T
     if not flip_y_axis:
         label_image = np.flipud(label_image)
 
-    # Convert dict to DataFrame with annotation_id as index
     annotation_map = pd.DataFrame([
         {'annotation_id': i+1, 'annotation_label': label, 'annotation_colour': color}
         for i, (label, color) in enumerate(annotation_dict.items())
-    ]).set_index('annotation_id')
+    ])
 
     return label_image, annotation_map

@@ -273,10 +273,10 @@ def annotator(tissue_tag_annotation, plot_size=1024, invert_y=False, use_datasha
         # Add "unassigned" to the beginning of the DataFrame if not present
         if "unassigned" not in tissue_tag_annotation.annotation_map['annotation_label'].values:
             unassigned_df = pd.DataFrame([{
-                'annotation_id': 0,
+                'annotation_id': 99,
                 'annotation_label': 'unassigned',
                 'annotation_colour': unassigned_colour
-            }]).set_index('annotation_id')
+            }])
             tissue_tag_annotation.annotation_map = pd.concat([unassigned_df, tissue_tag_annotation.annotation_map])
 
     if tissue_tag_annotation.label_image is None:
@@ -288,7 +288,7 @@ def annotator(tissue_tag_annotation, plot_size=1024, invert_y=False, use_datasha
             'annotation_id': 1,
             'annotation_label': 'default',
             'annotation_colour': '#00000000'
-        }]).set_index('annotation_id')
+        }])
         annotation = rgb_from_labels(tissue_tag_annotation)
         tissue_tag_annotation.annotation_map = provided_annotation_map
     else:
@@ -306,7 +306,7 @@ def annotator(tissue_tag_annotation, plot_size=1024, invert_y=False, use_datasha
     revert_button = pn.widgets.Button(name='Revert', button_type='danger', disabled=True)
     label_opacity = pn.widgets.FloatSlider(name='Label overlay', value=0.5, start=0, end=1, step=0.1)
 
-    def create_images(annotation_c=annotation_c, imarray_c=imarray_c):
+    def create_images(annotation_c, imarray_c):
         # Create new holoview images
         anno = hv.RGB(annotation_c, bounds=(0, 0, annotation_c.shape[1], annotation_c.shape[0]))
         if use_datashader:
@@ -324,18 +324,18 @@ def annotator(tissue_tag_annotation, plot_size=1024, invert_y=False, use_datasha
 
         return [ds_img, ds_anno]
 
-    plot_list = create_images()
+    plot_list = create_images(annotation_c, imarray_c)
 
     render_dict = {}
     path_dict = {}
-    for idx in tissue_tag_annotation.annotation_map.index:
-        label = tissue_tag_annotation.annotation_map.loc[idx, 'annotation_label']
-        color = tissue_tag_annotation.annotation_map.loc[idx, 'annotation_colour']
-        path_dict[label] = hv.Path([]).opts(color=color, line_width=5, line_alpha=0.7)
-        render_dict[label] = CustomFreehandDraw(source=path_dict[label], num_objects=200, tooltip=label,
-                                              icon_colour=color)
-
-        plot_list.append(path_dict[label])
+    for _, row in tissue_tag_annotation.annotation_map.iterrows():
+        annotation_id = row['annotation_id']
+        label = row['annotation_label']
+        colour = row['annotation_colour']
+        path_dict[annotation_id] = hv.Path([]).opts(color=colour, line_width=5, line_alpha=0.7)
+        render_dict[annotation_id] = CustomFreehandDraw(source=path_dict[annotation_id], num_objects=200, tooltip=label,
+                                               icon_colour=colour)
+        plot_list.append(path_dict[annotation_id])
 
     tab_object = pn.panel(hd.Overlay(plot_list).collate())
     # Create the tabbed view
@@ -354,17 +354,17 @@ def annotator(tissue_tag_annotation, plot_size=1024, invert_y=False, use_datasha
 
         previous_labels = tissue_tag_annotation.label_image.copy()
         updated_labels = tissue_tag_annotation.label_image.copy()
-        for idx, a in enumerate(render_dict.keys()):
-            if render_dict[a].data['xs']:
-                for o in range(len(render_dict[a].data['xs'])):
-                    x = np.array(render_dict[a].data['xs'][o]).astype(int)
-                    y = np.array(render_dict[a].data['ys'][o]).astype(int)
+        for annotation_id in render_dict.keys():
+            if render_dict[annotation_id].data['xs']:
+                for o in range(len(render_dict[annotation_id].data['xs'])):
+                    x = np.array(render_dict[annotation_id].data['xs'][o]).astype(int)
+                    y = np.array(render_dict[annotation_id].data['ys'][o]).astype(int)
                     rr, cc = polygon(y, x)
                     inshape = np.where(
                         np.array(tissue_tag_annotation.label_image.shape[0] > rr) & np.array(0 < rr) & np.array(
                             tissue_tag_annotation.label_image.shape[1] > cc) & np.array(
                             0 < cc))[0]
-                    updated_labels[rr[inshape], cc[inshape]] = idx + 1
+                    updated_labels[rr[inshape], cc[inshape]] = annotation_id
 
         tissue_tag_annotation.label_image = updated_labels
 
@@ -432,11 +432,9 @@ def rgb_from_labels(tissue_tag_annotation):
     labelimage_rgb = np.zeros(
         (tissue_tag_annotation.label_image.shape[0], tissue_tag_annotation.label_image.shape[1], 4))
 
-    # Iterate through annotation_ids and their colors
-    for annotation_id in tissue_tag_annotation.annotation_map.index:
-        colour = tissue_tag_annotation.annotation_map.loc[annotation_id, 'annotation_colour']
-        color = ImageColor.getcolor(colour, "RGBA")
-        labelimage_rgb[tissue_tag_annotation.label_image == annotation_id, 0:4] = np.array(color)
+    for _, row in tissue_tag_annotation.annotation_map.iterrows():
+        colour = ImageColor.getcolor(row['annotation_colour'], "RGBA")
+        labelimage_rgb[tissue_tag_annotation.label_image == row['annotation_id'], 0:4] = np.array(colour)
 
     return labelimage_rgb.astype('uint8')
 
@@ -641,7 +639,7 @@ def segmenter(tissue_tag_annotation, plot_size=1024, invert_y=False, use_datasha
         label_image = np.zeros((tissue_tag_annotation.image.shape[0], tissue_tag_annotation.image.shape[1]),
                                dtype=np.uint8)
         tissue_tag_annotation.label_image = label_image
-        tissue_tag_annotation.annotation_map = pd.DataFrame(columns=['annotation_label', 'annotation_colour']).rename_axis('annotation_id')
+        tissue_tag_annotation.annotation_map = pd.DataFrame(columns=['annotation_id', 'annotation_label', 'annotation_colour'])
 
     # convert label image to rgb for annotation
     annotation = rgb_from_labels(tissue_tag_annotation)
@@ -710,7 +708,7 @@ def segmenter(tissue_tag_annotation, plot_size=1024, invert_y=False, use_datasha
         previous_label = tissue_tag_annotation.label_image.copy()
         previous_annotation_map = tissue_tag_annotation.annotation_map.copy()
 
-        existing_object_count = len(tissue_tag_annotation.annotation_map) + 1
+        existing_object_count = tissue_tag_annotation.annotation_map["annotation_id"].max()
         print(existing_object_count)
         if erase_object.data['xs']:
             print("Erasing")
@@ -732,12 +730,10 @@ def segmenter(tissue_tag_annotation, plot_size=1024, invert_y=False, use_datasha
                 inshape = (tissue_tag_annotation.label_image.shape[0] > rr) & (0 < rr) & (
                             tissue_tag_annotation.label_image.shape[1] > cc) & (
                                   0 < cc)  # make sure pixels outside the image are ignored
-                tissue_tag_annotation.label_image[rr[inshape], cc[inshape]] = existing_object_count + o
-                new_label = annotation_prefix + '_' + str(existing_object_count + o)
-                tissue_tag_annotation.annotation_map.loc[existing_object_count + o] = {
-                    'annotation_label': new_label,
-                    'annotation_colour': random.choice(colorpool)
-                }
+                new_segment_id = existing_object_count + o
+                tissue_tag_annotation.label_image[rr[inshape], cc[inshape]] = new_segment_id
+                new_label = annotation_prefix + '_' + str(new_segment_id)
+                tissue_tag_annotation.annotation_map.loc[new_segment_id] = [new_segment_id, new_label, random.choice(colorpool)]
 
         annotation = rgb_from_labels(tissue_tag_annotation)
         annotation_c = annotation.astype('uint8').copy()
@@ -787,7 +783,7 @@ def segmenter(tissue_tag_annotation, plot_size=1024, invert_y=False, use_datasha
 
 
 def gene_labels_from_adata(adata, gene_markers, tissue_tag_annotation, diameter, override_labels=False,
-                           space_every_spots=10, normalize=True, unassigned_colour="yellow", intensity_threshold=230,
+                           grid_unit_size=10, normalize=True, unassigned_colour="yellow", intensity_threshold=230,
                            copy=False):
     """
     Assign labels to training spots based on gene expression from an existing AnnData object.
@@ -804,7 +800,7 @@ def gene_labels_from_adata(adata, gene_markers, tissue_tag_annotation, diameter,
         Radius of the spots.
     override_labels : bool
         Remove existing label_image and replace with new labels.
-    space_every_spots : int, optional
+    grid_unit_size : int, optional
         Spacing between background spots. Default is 10.
     normalize : bool
         if to normalize gene expression by default parametres calculated by - scanpy.pp.normalize_total()
@@ -843,21 +839,106 @@ def gene_labels_from_adata(adata, gene_markers, tissue_tag_annotation, diameter,
         # Add "unassigned" to the beginning of the DataFrame if not present
         if "unassigned" not in tissue_tag_annotation.annotation_map['annotation_label'].values:
             unassigned_df = pd.DataFrame([{
-                'annotation_id': 0,
+                'annotation_id': 99,
                 'annotation_label': 'unassigned',
                 'annotation_colour': unassigned_colour
-            }]).set_index('annotation_id')
+            }])
             tissue_tag_annotation.annotation_map = pd.concat([unassigned_df, tissue_tag_annotation.annotation_map])
 
     # Filter adata to match df indices
     adata = adata[tissue_tag_annotation.positions.index.intersection(adata.obs.index)]
     r = diameter / 2 * tissue_tag_annotation.ppm
 
+    def square_grid(spot_size, shape, grid_unit_size):
+        """
+        Generate a square grid
+
+        Parameters
+        ----------
+        spot_size : float
+            Size of the spots.
+        shape : tuple
+            Shape of the grid (height, width).
+        grid_unit_size : int
+            Spacing between background spots.
+
+        Returns
+        -------
+        numpy.ndarray
+            Array containing the coordinates of the grid.
+        """
+        # Define step sizes
+        dx = spot_size * grid_unit_size  # Horizontal spacing
+        dy = spot_size * grid_unit_size  # Vertical spacing
+
+        # Generate meshgrid for a square grid
+        x_coords = np.arange(spot_size, shape[0] - spot_size, dx)
+        y_coords = np.arange(spot_size, shape[1] - spot_size, dy)
+
+        gx, gy = np.meshgrid(x_coords, y_coords)
+
+        # Stack the x and y coordinates
+        positions = np.vstack([gy.ravel(), gx.ravel()])
+
+        return positions
+
+    def background_labels_intensity(shape, imarray, r, intensity_threshold=230, grid_unit_size=10, background_label=99):
+        """
+        Generate background labels based on intensity (bright pixels in brightfield images).
+
+        Parameters
+        ----------
+        shape : tuple
+            Shape of the training labels array.
+        imarray : numpy.ndarray
+            RGB image used to identify bright background areas.
+        r : float
+            Radius of the spots.
+        intensity_threshold : int, optional
+            Threshold above which pixels are considered background. Default is 230.
+        grid_unit_size : int, optional
+            Spacing between background spots. Default is 10.
+        background_label : int, optional
+            Label value for background spots. Default is 99 (i.e. value for unassigned).
+
+        Returns
+        -------
+        numpy.ndarray
+            Array containing the background labels.
+        """
+
+        # Convert RGBA to grayscale using only RGB channels
+        if imarray.shape[-1] == 4:  # RGBA
+            grayscale = np.dot(imarray[..., :3], [0.2989, 0.5870, 0.1140])  # Standard grayscale conversion
+        elif imarray.shape[-1] == 3:  # RGB
+            grayscale = np.dot(imarray, [0.2989, 0.5870, 0.1140])
+        else:
+            raise ValueError("Unexpected number of channels in imarray.")
+
+        # Identify bright pixels in the grayscale image (background areas)
+        background_mask = grayscale > intensity_threshold
+
+        background_labels = np.zeros(shape, dtype=np.uint8)
+        grid = square_grid(r, shape, grid_unit_size).T
+
+        print(imarray.shape)
+
+        for coor in grid:
+            y, x = int(coor[1]), int(coor[0])  # Ensure integer indices
+            if y >= background_mask.shape[0] or x >= background_mask.shape[1]:  # Avoid out-of-bounds indexing
+                continue
+            if np.any(background_mask[y, x]):  # Use `.any()` if needed
+                background_labels[disk((y, x), r, shape=shape)] = background_label
+
+        return background_labels
+
     # Extract coordinates
     labels = background_labels_intensity(tissue_tag_annotation.label_image.shape[:2],
-                                         imarray=tissue_tag_annotation.image, r=r,
-                                         intensity_threshold=intensity_threshold, space_every_spots=space_every_spots,
-                                         label=1)
+                                         imarray=tissue_tag_annotation.image,
+                                         r=r,
+                                         intensity_threshold=intensity_threshold,
+                                         grid_unit_size=grid_unit_size,
+                                         background_label=99)
     mask = tissue_tag_annotation.label_image > 0
     labels[mask] = tissue_tag_annotation.label_image[mask]  # add old labels if these are not empty
 
@@ -865,11 +946,16 @@ def gene_labels_from_adata(adata, gene_markers, tissue_tag_annotation, diameter,
         normalize_total(adata)
 
     # Assign labels based on gene expression
-    for marker, gene_list in gene_markers.items():
+    for label, gene_list in gene_markers.items():
         # Get the expected color for the marker
-        marker_row = tissue_tag_annotation.annotation_map[tissue_tag_annotation.annotation_map['annotation_label'] == marker]
-        marker_color = marker_row['annotation_colour'].iloc[0] if len(marker_row) > 0 else "N/A"
-        print(f"🧬 Processing marker: '{marker}' | Color: {marker_color} | Genes: {[gene for gene, _ in gene_list]}")
+        annotation_row = tissue_tag_annotation.annotation_map[tissue_tag_annotation.annotation_map['annotation_label'] == label]
+
+        if len(annotation_row) == 0:
+            print(f"Label '{label}' missing from annotation_map. Skipping this label.")
+            continue
+
+        marker_colour = annotation_row['annotation_colour'].values[0]
+        print(f"Processing label: '{label}' | Color: {marker_colour} | Genes: {[gene for gene, _ in gene_list]}")
 
         combined_gene_indices = []
 
@@ -907,104 +993,12 @@ def gene_labels_from_adata(adata, gene_markers, tissue_tag_annotation, diameter,
         # Remove duplicates and convert to a set for faster lookups later
         combined_gene_indices = set(combined_gene_indices)
 
-        # Assign labels - find the annotation_id for the marker
-        matching_ids = tissue_tag_annotation.annotation_map[
-            tissue_tag_annotation.annotation_map['annotation_label'] == marker
-        ].index
-        label_value = matching_ids[0] if len(matching_ids) > 0 else None
-
-        if label_value is not None:
-            for coor in tissue_tag_annotation.positions.loc[list(combined_gene_indices), ["pxl_row", "pxl_col"]].to_numpy():
-                labels[disk((coor[0], coor[1]), r)] = label_value
+        for coor in tissue_tag_annotation.positions.loc[list(combined_gene_indices), ["pxl_row", "pxl_col"]].to_numpy():
+            labels[disk((coor[0], coor[1]), r)] = annotation_row["annotation_id"].values[0]
 
     tissue_tag_annotation.label_image = labels
 
     return tissue_tag_annotation if copy else None
-
-
-def background_labels_intensity(shape, imarray, r, intensity_threshold=230, space_every_spots=10, label=1):
-    """
-    Generate background labels based on intensity (bright pixels in brightfield images).
-
-    Parameters
-    ----------
-    shape : tuple
-        Shape of the training labels array.
-    imarray : numpy.ndarray
-        RGB image used to identify bright background areas.
-    r : float
-        Radius of the spots.
-    intensity_threshold : int, optional
-        Threshold above which pixels are considered background. Default is 230.
-    space_every_spots : int, optional
-        Spacing between background spots. Default is 10.
-    label : int, optional
-        Label value for background spots. Default is 1.
-
-    Returns
-    -------
-    numpy.ndarray
-        Array containing the background labels.
-    """
-
-    # Convert RGBA to grayscale using only RGB channels
-    if imarray.shape[-1] == 4:  # RGBA
-        grayscale = np.dot(imarray[..., :3], [0.2989, 0.5870, 0.1140])  # Standard grayscale conversion
-    elif imarray.shape[-1] == 3:  # RGB
-        grayscale = np.dot(imarray, [0.2989, 0.5870, 0.1140])
-    else:
-        raise ValueError("Unexpected number of channels in imarray.")
-
-    # Identify bright pixels in the grayscale image (background areas)
-    background_mask = grayscale > intensity_threshold
-
-    training_labels = np.zeros(shape, dtype=np.uint8)
-    grid = square_grid(r, shape, space_every_spots).T
-
-    print(imarray.shape)
-
-    for coor in grid:
-        y, x = int(coor[1]), int(coor[0])  # Ensure integer indices
-        if y >= background_mask.shape[0] or x >= background_mask.shape[1]:  # Avoid out-of-bounds indexing
-            continue
-        if np.any(background_mask[y, x]):  # Use `.any()` if needed
-            training_labels[disk((y, x), r, shape=shape)] = label
-
-    return training_labels
-
-
-def square_grid(spot_size, shape, space_every_spots):
-    """
-    Generate a square grid
-
-    Parameters
-    ----------
-    spot_size : float
-        Size of the spots.
-    shape : tuple
-        Shape of the grid (height, width).
-    space_every_spots : int
-        Spacing between background spots.
-
-    Returns
-    -------
-    numpy.ndarray
-        Array containing the coordinates of the grid.
-    """
-    # Define step sizes
-    dx = spot_size * space_every_spots  # Horizontal spacing
-    dy = spot_size * space_every_spots  # Vertical spacing
-
-    # Generate meshgrid for a square grid
-    x_coords = np.arange(spot_size, shape[0] - spot_size, dx)
-    y_coords = np.arange(spot_size, shape[1] - spot_size, dy)
-
-    gx, gy = np.meshgrid(x_coords, y_coords)
-
-    # Stack the x and y coordinates
-    positions = np.vstack([gy.ravel(), gx.ravel()])
-
-    return positions
 
 
 def median_filter(tissue_tag_annotation, filter_radius=10, downsampling_factor=1, copy=False):
@@ -1108,7 +1102,7 @@ def plot_cell_label_annotations(tissue_tag_annotation, cell_diameter=5.0, annota
     if tissue_tag_annotation.positions is None:
         raise ValueError("Positions data frame is missing. Please provide positions data frame.")
     if annotation_column not in tissue_tag_annotation.positions.columns is None:
-        raise ValueError("Annotation column in posititions data frame is missing. Please assign annotation to cells first.")
+        raise ValueError("Annotation column in positions data frame is missing. Please assign annotation to cells first.")
 
     fig, ax = plt.subplots(figsize=(10, 10), dpi = 100)
 
@@ -1118,15 +1112,15 @@ def plot_cell_label_annotations(tissue_tag_annotation, cell_diameter=5.0, annota
     ax.imshow(base_img, origin='lower')
 
     marker_size_pixels = cell_diameter * tissue_tag_annotation.ppm
-    for idx in tissue_tag_annotation.annotation_map.index:
-        ann = tissue_tag_annotation.annotation_map.loc[idx, 'annotation_label']
-        color = tissue_tag_annotation.annotation_map.loc[idx, 'annotation_colour']
-        selected_position = tissue_tag_annotation.positions[tissue_tag_annotation.positions[annotation_column] == ann]
+    for _, row in tissue_tag_annotation.annotation_map.iterrows():
+        label = row['annotation_label']
+        colour = row['annotation_colour']
+        selected_position = tissue_tag_annotation.positions[tissue_tag_annotation.positions[annotation_column] == label]
         zipped = np.broadcast(selected_position["pxl_col"], selected_position["pxl_row"], marker_size_pixels * 0.5)
         patches = [Circle((x_, y_), s_) for x_, y_, s_ in zipped]
         collection = PatchCollection(patches)
-        collection.set_facecolor(color)
-        collection.set_edgecolor(color)
+        collection.set_facecolor(colour)
+        collection.set_edgecolor(colour)
         collection.set_alpha(1-alpha)
         ax.add_collection(collection)
 

@@ -70,6 +70,11 @@ def run_tissuetag_visium_distance_pipeline(
     dict
         Dictionary object containing a list of overwritten column(s) and newly added column(s) in anndata.obs.
     """
+    try:
+        import anndata  # noqa: F401
+    except Exception:
+        raise ImportError("The `anndata` package is required for running this pipeline.")
+
     adata = adata.copy() if copy_adata else adata
 
     if 'spatial' not in adata.uns:
@@ -161,10 +166,9 @@ def get_annotations_for_objects(tissue_tag_annotation, coord_df):
         raise ValueError("Please provide a DataFrame containing two columns with x,y coordinates only.")
 
     # Create mapping from annotation_id to annotation_label
-    annotation_label_mapping = {annotation_id: tissue_tag_annotation.annotation_map.loc[annotation_id, 'annotation_label'] 
-                                for annotation_id in tissue_tag_annotation.annotation_map.index}
+    annotation_label_mapping = tissue_tag_annotation.annotation_map.set_index('annotation_id')['annotation_label'].to_dict()
     annotation_ids = tissue_tag_annotation.label_image[np.rint(coord_df["x"]).astype(int), np.rint(coord_df["y"]).astype(int)]
-    vectorized_map = np.vectorize(lambda x: annotation_label_mapping.get(x, "Unknown"), otypes=[object])
+    vectorized_map = np.vectorize(lambda x: annotation_label_mapping.get(x, "unknown"), otypes=[object])
 
     return vectorized_map(annotation_ids)
 
@@ -303,7 +307,7 @@ def generate_grid_from_annotation(tissue_tag_annotation, grid_unit_size, ppm_out
           f'from annotation resolution of - {tissue_tag_annotation.ppm} ppm')
 
     positions = generate_hires_grid(tissue_tag_annotation.label_image, grid_unit_size,
-                                    tissue_tag_annotation.ppm).T  # Transpose for correct orientation
+                                    tissue_tag_annotation.ppm).T  # Transpose for correct orientation. Why not just make generate_hires_grid not return a Transposed matrix?
 
     radius = int(round((grid_unit_size / 2) * tissue_tag_annotation.ppm) - 1)
     kernel = create_disk_kernel(radius, (2 * radius + 1, 2 * radius + 1))
@@ -315,15 +319,12 @@ def generate_grid_from_annotation(tissue_tag_annotation, grid_unit_size, ppm_out
                                          preserve_range=True).astype('uint8')
     filtered_image = scipy.ndimage.median_filter(anno_orig, footprint=kernel)
 
-    median_values = [filtered_image[int(point[1]), int(point[0])] for point in positions]
-    # Create mapping from annotation_id to annotation_label
-    annotation_label_list = {annotation_id: tissue_tag_annotation.annotation_map.loc[annotation_id, 'annotation_label'] 
-                            for annotation_id in tissue_tag_annotation.annotation_map.index}
-    anno_dict = {idx: annotation_label_list.get(val, "Unknown") for idx, val in enumerate(median_values)}
-    number_dict = {idx: val for idx, val in enumerate(median_values)}
+    median_values = filtered_image[positions[:, 1].astype(int), positions[:, 0].astype(int)]
+    annotation_label_mapping = tissue_tag_annotation.annotation_map.set_index('annotation_id')['annotation_label'].to_dict()
+    vectorized_map = np.vectorize(lambda x: annotation_label_mapping.get(x, "unknown"), otypes=[object])
 
-    df[annotation_column] = list(anno_dict.values())
-    df[annotation_column + '_number'] = list(number_dict.values())
+    df[annotation_column + '_id'] = median_values
+    df[annotation_column] = vectorized_map(median_values)
 
     df['x'] = df['x'] * ppm_out / tissue_tag_annotation.ppm
     df['y'] = df['y'] * ppm_out / tissue_tag_annotation.ppm
