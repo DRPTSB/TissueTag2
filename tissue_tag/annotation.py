@@ -270,16 +270,25 @@ def annotator(tissue_tag_annotation, plot_size=1024, invert_y=False, use_datasha
     if tissue_tag_annotation.annotation_map is None:
         raise ValueError("Annotation map is missing. Please provide annotation map.")
     else:
-        tissue_tag_annotation.annotation_map = OrderedDict(tissue_tag_annotation.annotation_map)
-        tissue_tag_annotation.annotation_map["unassigned"] = unassigned_colour
-        tissue_tag_annotation.annotation_map.move_to_end("unassigned", last=False)
+        # Add "unassigned" to the beginning of the DataFrame if not present
+        if "unassigned" not in tissue_tag_annotation.annotation_map['annotation_label'].values:
+            unassigned_df = pd.DataFrame([{
+                'annotation_id': 0,
+                'annotation_label': 'unassigned',
+                'annotation_colour': unassigned_colour
+            }]).set_index('annotation_id')
+            tissue_tag_annotation.annotation_map = pd.concat([unassigned_df, tissue_tag_annotation.annotation_map])
 
     if tissue_tag_annotation.label_image is None:
         label_image = np.zeros((tissue_tag_annotation.image.shape[0], tissue_tag_annotation.image.shape[1]),
                                dtype=np.uint8)
         tissue_tag_annotation.label_image = label_image
         provided_annotation_map = tissue_tag_annotation.annotation_map.copy()
-        tissue_tag_annotation.annotation_map = {'default': '#00000000'}
+        tissue_tag_annotation.annotation_map = pd.DataFrame([{
+            'annotation_id': 1,
+            'annotation_label': 'default',
+            'annotation_colour': '#00000000'
+        }]).set_index('annotation_id')
         annotation = rgb_from_labels(tissue_tag_annotation)
         tissue_tag_annotation.annotation_map = provided_annotation_map
     else:
@@ -319,12 +328,14 @@ def annotator(tissue_tag_annotation, plot_size=1024, invert_y=False, use_datasha
 
     render_dict = {}
     path_dict = {}
-    for key in tissue_tag_annotation.annotation_map.keys():
-        path_dict[key] = hv.Path([]).opts(color=tissue_tag_annotation.annotation_map[key], line_width=5, line_alpha=0.7)
-        render_dict[key] = CustomFreehandDraw(source=path_dict[key], num_objects=200, tooltip=key,
-                                              icon_colour=tissue_tag_annotation.annotation_map[key])
+    for idx in tissue_tag_annotation.annotation_map.index:
+        label = tissue_tag_annotation.annotation_map.loc[idx, 'annotation_label']
+        color = tissue_tag_annotation.annotation_map.loc[idx, 'annotation_colour']
+        path_dict[label] = hv.Path([]).opts(color=color, line_width=5, line_alpha=0.7)
+        render_dict[label] = CustomFreehandDraw(source=path_dict[label], num_objects=200, tooltip=label,
+                                              icon_colour=color)
 
-        plot_list.append(path_dict[key])
+        plot_list.append(path_dict[label])
 
     tab_object = pn.panel(hd.Overlay(plot_list).collate())
     # Create the tabbed view
@@ -421,7 +432,7 @@ def rgb_from_labels(tissue_tag_annotation):
     labelimage_rgb = np.zeros(
         (tissue_tag_annotation.label_image.shape[0], tissue_tag_annotation.label_image.shape[1], 4))
 
-    colours = list(tissue_tag_annotation.annotation_map.values())
+    colours = tissue_tag_annotation.annotation_map['annotation_colour'].tolist()
     for c in range(len(colours)):
         color = ImageColor.getcolor(colours[c], "RGBA")
         labelimage_rgb[tissue_tag_annotation.label_image == c + 1, 0:4] = np.array(color)
@@ -629,7 +640,7 @@ def segmenter(tissue_tag_annotation, plot_size=1024, invert_y=False, use_datasha
         label_image = np.zeros((tissue_tag_annotation.image.shape[0], tissue_tag_annotation.image.shape[1]),
                                dtype=np.uint8)
         tissue_tag_annotation.label_image = label_image
-        tissue_tag_annotation.annotation_map = OrderedDict({})
+        tissue_tag_annotation.annotation_map = pd.DataFrame(columns=['annotation_label', 'annotation_colour']).rename_axis('annotation_id')
 
     # convert label image to rgb for annotation
     annotation = rgb_from_labels(tissue_tag_annotation)
@@ -698,7 +709,7 @@ def segmenter(tissue_tag_annotation, plot_size=1024, invert_y=False, use_datasha
         previous_label = tissue_tag_annotation.label_image.copy()
         previous_annotation_map = tissue_tag_annotation.annotation_map.copy()
 
-        existing_object_count = len(tissue_tag_annotation.annotation_map.keys()) + 1
+        existing_object_count = len(tissue_tag_annotation.annotation_map) + 1
         print(existing_object_count)
         if erase_object.data['xs']:
             print("Erasing")
@@ -721,8 +732,11 @@ def segmenter(tissue_tag_annotation, plot_size=1024, invert_y=False, use_datasha
                             tissue_tag_annotation.label_image.shape[1] > cc) & (
                                   0 < cc)  # make sure pixels outside the image are ignored
                 tissue_tag_annotation.label_image[rr[inshape], cc[inshape]] = existing_object_count + o
-                tissue_tag_annotation.annotation_map[annotation_prefix + '_' + str(existing_object_count + o)] = (
-                    random.choice(colorpool))
+                new_label = annotation_prefix + '_' + str(existing_object_count + o)
+                tissue_tag_annotation.annotation_map.loc[existing_object_count + o] = {
+                    'annotation_label': new_label,
+                    'annotation_colour': random.choice(colorpool)
+                }
 
         annotation = rgb_from_labels(tissue_tag_annotation)
         annotation_c = annotation.astype('uint8').copy()
@@ -825,9 +839,14 @@ def gene_labels_from_adata(adata, gene_markers, tissue_tag_annotation, diameter,
     if tissue_tag_annotation.annotation_map is None:
         raise ValueError("Annotation map is missing. Please provide an annotation map.")
     else:
-        tissue_tag_annotation.annotation_map = OrderedDict(tissue_tag_annotation.annotation_map)
-        tissue_tag_annotation.annotation_map["unassigned"] = unassigned_colour
-        tissue_tag_annotation.annotation_map.move_to_end("unassigned", last=False)
+        # Add "unassigned" to the beginning of the DataFrame if not present
+        if "unassigned" not in tissue_tag_annotation.annotation_map['annotation_label'].values:
+            unassigned_df = pd.DataFrame([{
+                'annotation_id': 0,
+                'annotation_label': 'unassigned',
+                'annotation_colour': unassigned_colour
+            }]).set_index('annotation_id')
+            tissue_tag_annotation.annotation_map = pd.concat([unassigned_df, tissue_tag_annotation.annotation_map])
 
     # Filter adata to match df indices
     adata = adata[tissue_tag_annotation.positions.index.intersection(adata.obs.index)]
@@ -847,7 +866,8 @@ def gene_labels_from_adata(adata, gene_markers, tissue_tag_annotation, diameter,
     # Assign labels based on gene expression
     for marker, gene_list in gene_markers.items():
         # Get the expected color for the marker
-        marker_color = tissue_tag_annotation.annotation_map.get(marker, "N/A")
+        marker_row = tissue_tag_annotation.annotation_map[tissue_tag_annotation.annotation_map['annotation_label'] == marker]
+        marker_color = marker_row['annotation_colour'].iloc[0] if len(marker_row) > 0 else "N/A"
         print(f"🧬 Processing marker: '{marker}' | Color: {marker_color} | Genes: {[gene for gene, _ in gene_list]}")
 
         combined_gene_indices = []
@@ -886,13 +906,15 @@ def gene_labels_from_adata(adata, gene_markers, tissue_tag_annotation, diameter,
         # Remove duplicates and convert to a set for faster lookups later
         combined_gene_indices = set(combined_gene_indices)
 
-        # Assign labels
-        for idx, sub in enumerate(tissue_tag_annotation.annotation_map.keys()):
-            if sub == marker:
+        # Assign labels - find the position of the marker in annotation_map
+        label_value = None
+        for idx, row_idx in enumerate(tissue_tag_annotation.annotation_map.index):
+            if tissue_tag_annotation.annotation_map.loc[row_idx, 'annotation_label'] == marker:
                 label_value = idx
 
-        for coor in tissue_tag_annotation.positions.loc[list(combined_gene_indices), ["pxl_row", "pxl_col"]].to_numpy():
-            labels[disk((coor[0], coor[1]), r)] = label_value + 1
+        if label_value is not None:
+            for coor in tissue_tag_annotation.positions.loc[list(combined_gene_indices), ["pxl_row", "pxl_col"]].to_numpy():
+                labels[disk((coor[0], coor[1]), r)] = label_value + 1
 
     tissue_tag_annotation.label_image = labels
 
@@ -1095,7 +1117,9 @@ def plot_cell_label_annotations(tissue_tag_annotation, cell_diameter=5.0, annota
     ax.imshow(base_img, origin='lower')
 
     marker_size_pixels = cell_diameter * tissue_tag_annotation.ppm
-    for ann, color in tissue_tag_annotation.annotation_map.items():
+    for idx in tissue_tag_annotation.annotation_map.index:
+        ann = tissue_tag_annotation.annotation_map.loc[idx, 'annotation_label']
+        color = tissue_tag_annotation.annotation_map.loc[idx, 'annotation_colour']
         selected_position = tissue_tag_annotation.positions[tissue_tag_annotation.positions[annotation_column] == ann]
         zipped = np.broadcast(selected_position["pxl_col"], selected_position["pxl_row"], marker_size_pixels * 0.5)
         patches = [Circle((x_, y_), s_) for x_, y_, s_ in zipped]
