@@ -432,10 +432,11 @@ def rgb_from_labels(tissue_tag_annotation):
     labelimage_rgb = np.zeros(
         (tissue_tag_annotation.label_image.shape[0], tissue_tag_annotation.label_image.shape[1], 4))
 
-    colours = tissue_tag_annotation.annotation_map['annotation_colour'].tolist()
-    for c in range(len(colours)):
-        color = ImageColor.getcolor(colours[c], "RGBA")
-        labelimage_rgb[tissue_tag_annotation.label_image == c + 1, 0:4] = np.array(color)
+    # Iterate through annotation_ids and their colors
+    for annotation_id in tissue_tag_annotation.annotation_map.index:
+        colour = tissue_tag_annotation.annotation_map.loc[annotation_id, 'annotation_colour']
+        color = ImageColor.getcolor(colour, "RGBA")
+        labelimage_rgb[tissue_tag_annotation.label_image == annotation_id, 0:4] = np.array(color)
 
     return labelimage_rgb.astype('uint8')
 
@@ -906,15 +907,16 @@ def gene_labels_from_adata(adata, gene_markers, tissue_tag_annotation, diameter,
         # Remove duplicates and convert to a set for faster lookups later
         combined_gene_indices = set(combined_gene_indices)
 
-        # Assign labels - find the position of the marker in annotation_map
+        # Assign labels - find the annotation_id for the marker
         label_value = None
-        for idx, row_idx in enumerate(tissue_tag_annotation.annotation_map.index):
-            if tissue_tag_annotation.annotation_map.loc[row_idx, 'annotation_label'] == marker:
-                label_value = idx
+        for annotation_id in tissue_tag_annotation.annotation_map.index:
+            if tissue_tag_annotation.annotation_map.loc[annotation_id, 'annotation_label'] == marker:
+                label_value = annotation_id
+                break
 
         if label_value is not None:
             for coor in tissue_tag_annotation.positions.loc[list(combined_gene_indices), ["pxl_row", "pxl_col"]].to_numpy():
-                labels[disk((coor[0], coor[1]), r)] = label_value + 1
+                labels[disk((coor[0], coor[1]), r)] = label_value
 
     tissue_tag_annotation.label_image = labels
 

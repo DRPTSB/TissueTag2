@@ -160,7 +160,9 @@ def get_annotations_for_objects(tissue_tag_annotation, coord_df):
     if coord_df.shape[1] != 2:
         raise ValueError("Please provide a DataFrame containing two columns with x,y coordinates only.")
 
-    annotation_label_mapping = {i + 1: v for i, v in enumerate(tissue_tag_annotation.annotation_map.keys())}
+    # Create mapping from annotation_id to annotation_label
+    annotation_label_mapping = {annotation_id: tissue_tag_annotation.annotation_map.loc[annotation_id, 'annotation_label'] 
+                                for annotation_id in tissue_tag_annotation.annotation_map.index}
     annotation_ids = tissue_tag_annotation.label_image[np.rint(coord_df["x"]).astype(int), np.rint(coord_df["y"]).astype(int)]
     vectorized_map = np.vectorize(lambda x: annotation_label_mapping.get(x, "Unknown"), otypes=[object])
 
@@ -314,7 +316,9 @@ def generate_grid_from_annotation(tissue_tag_annotation, grid_unit_size, ppm_out
     filtered_image = scipy.ndimage.median_filter(anno_orig, footprint=kernel)
 
     median_values = [filtered_image[int(point[1]), int(point[0])] for point in positions]
-    annotation_label_list = {i + 1: v for i, v in enumerate(tissue_tag_annotation.annotation_map.keys())}
+    # Create mapping from annotation_id to annotation_label
+    annotation_label_list = {annotation_id: tissue_tag_annotation.annotation_map.loc[annotation_id, 'annotation_label'] 
+                            for annotation_id in tissue_tag_annotation.annotation_map.index}
     anno_dict = {idx: annotation_label_list.get(val, "Unknown") for idx, val in enumerate(median_values)}
     number_dict = {idx: val for idx, val in enumerate(median_values)}
 
