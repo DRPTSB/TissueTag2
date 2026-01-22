@@ -78,8 +78,12 @@ def load_annotation(file_path):
             annotation_dict = json.loads(f['annotation_map'][()])
             # Check if it's the old dict format or new DataFrame format
             if isinstance(annotation_dict, dict) and 'columns' in annotation_dict and 'data' in annotation_dict:
-                # New DataFrame format
-                annotation_map = pd.DataFrame.from_dict(annotation_dict, orient='split')
+                # New DataFrame format (saved with to_dict(orient='split'))
+                annotation_map = pd.DataFrame(
+                    annotation_dict['data'],
+                    columns=annotation_dict['columns'],
+                    index=annotation_dict['index']
+                )
             else:
                 # Old dict format - convert to DataFrame
                 annotation_map = pd.DataFrame([
