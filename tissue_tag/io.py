@@ -24,11 +24,9 @@ class TissueTagAnnotation:
     annotation_map: Optional[pd.DataFrame] = None
     positions: Optional[pd.DataFrame] = None
     grid: Optional[pd.DataFrame] = None
-
-    @property
-    def version(self):
-        """Version of the TissueTagAnnotation class."""
-        return 1.1
+    
+    # Class constant for version
+    VERSION = 1.1
 
     def save_annotation(self, file_path):
         """
@@ -46,7 +44,7 @@ class TissueTagAnnotation:
                 f.create_dataset('ppm', data=self.ppm)
             if self.label_image is not None:
                 f.create_dataset('label_image', data=self.label_image)
-            f.create_dataset("version", data=self.version)
+            f.create_dataset("version", data=self.VERSION)
         if self.annotation_map is not None:
             self.annotation_map.to_hdf(file_path, key="annotation_map", mode="a")
         if self.positions is not None:
@@ -71,7 +69,7 @@ def load_annotation(file_path):
     """
     with h5py.File(file_path, 'r') as f:
         version = f['version'][()] if 'version' in f else 1.0
-        if version < TissueTagAnnotation.version:
+        if version < TissueTagAnnotation.VERSION:
             print(f'> Loading an older version of TissueTagAnnotation object...')
 
         if 'image' in f:
@@ -90,7 +88,7 @@ def load_annotation(file_path):
         if 'annotation_map' in f:
             annotation_dict = json.loads(f['annotation_map'][()])
             # Check if the saved object version is up to date
-            if version < TissueTagAnnotation.version:
+            if version < TissueTagAnnotation.VERSION:
                 annotation_map = pd.read_hdf(file_path, key="positions")
             else:
                 print(f'> Updating annotation map structure...')
