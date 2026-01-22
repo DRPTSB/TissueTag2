@@ -21,9 +21,14 @@ class TissueTagAnnotation:
     ppm: float
     label_image: Optional[np.array] = None
     # Note that value 0 in label_image is a special value to indicate no annotation has been assigned
-    annotation_map: Optional[dict] = None
+    annotation_map: Optional[pd.DataFrame] = None
     positions: Optional[pd.DataFrame] = None
     grid: Optional[pd.DataFrame] = None
+
+    @property
+    def version(self):
+        """Version of the TissueTagAnnotation class."""
+        return "1.1"
 
     def save_annotation(self, file_path):
         """
@@ -42,7 +47,8 @@ class TissueTagAnnotation:
             if self.label_image is not None:
                 f.create_dataset('label_image', data=self.label_image)
             if self.annotation_map is not None:
-                f.create_dataset('annotation_map', data=json.dumps(self.annotation_map))
+                # Save DataFrame as JSON with orient='split' to preserve index
+                f.create_dataset('annotation_map', data=json.dumps(self.annotation_map.to_dict(orient='split')))
         if self.positions is not None:
             self.positions.to_hdf(file_path, key="positions", mode="a")
         if self.grid is not None:
@@ -67,7 +73,19 @@ def load_annotation(file_path):
         image = f['image'][:] if 'image' in f else None
         ppm = f['ppm'][()] if 'ppm' in f else None
         label_image = f['label_image'][:] if 'label_image' in f else None
-        annotation_map = json.loads(f['annotation_map'][()]) if 'annotation_map' in f else None
+        annotation_map = None
+        if 'annotation_map' in f:
+            annotation_dict = json.loads(f['annotation_map'][()])
+            # Check if it's the old dict format or new DataFrame format
+            if isinstance(annotation_dict, dict) and 'columns' in annotation_dict and 'data' in annotation_dict:
+                # New DataFrame format
+                annotation_map = pd.DataFrame.from_dict(annotation_dict, orient='split')
+            else:
+                # Old dict format - convert to DataFrame
+                annotation_map = pd.DataFrame([
+                    {'annotation_id': i+1, 'annotation_label': label, 'annotation_colour': color}
+                    for i, (label, color) in enumerate(annotation_dict.items())
+                ]).set_index('annotation_id')
         positions = None
         if 'positions' in f:
             positions = pd.read_hdf(file_path, key="positions")
@@ -784,8 +802,8 @@ def import_geojson_annotation(geojson_path, ori_shape, im_shape, sort_features=T
     -------
     np.array
         Label image
-    dict
-        Annotation map
+    pd.DataFrame
+        Annotation map DataFrame with columns [annotation_label, annotation_colour] indexed by annotation_id
     """
 
     try:
@@ -799,7 +817,7 @@ def import_geojson_annotation(geojson_path, ori_shape, im_shape, sort_features=T
     with open(geojson_path, "r") as f:
         geojson_obj = json.load(f)
 
-    annotation_map = {}
+    annotation_dict = {}
     for feature in geojson_obj['features']:
         geom = feature['geometry']
         props = feature.get('properties', {})
@@ -811,7 +829,7 @@ def import_geojson_annotation(geojson_path, ori_shape, im_shape, sort_features=T
         feat_anno = classification.get("name", "Unclassified")
         feat_colour = classification.get("color", [255,255,255])
 
-        annotation_map[feat_anno] = "#{0:02x}{1:02x}{2:02x}00".format(*feat_colour)
+        annotation_dict[feat_anno] = "#{0:02x}{1:02x}{2:02x}00".format(*feat_colour)
 
         # Calculate bounding area
         minx, miny, maxx, maxy = features.bounds(geom)
@@ -828,7 +846,7 @@ def import_geojson_annotation(geojson_path, ori_shape, im_shape, sort_features=T
 
     out_transform = transform.from_bounds(0, 0, ori_shape[0], ori_shape[1], im_shape[1], im_shape[0])
 
-    annotation_class = list(annotation_map.keys())
+    annotation_class = list(annotation_dict.keys())
     shapes_gen = ((item['geom'], annotation_class.index(item['anno'])+1) for item in annotation_geometries)
 
     label_image = features.rasterize(
@@ -843,5 +861,11 @@ def import_geojson_annotation(geojson_path, ori_shape, im_shape, sort_features=T
 
     if not flip_y_axis:
         label_image = np.flipud(label_image)
+
+    # Convert dict to DataFrame with annotation_id as index
+    annotation_map = pd.DataFrame([
+        {'annotation_id': i+1, 'annotation_label': label, 'annotation_colour': color}
+        for i, (label, color) in enumerate(annotation_dict.items())
+    ]).set_index('annotation_id')
 
     return label_image, annotation_map
