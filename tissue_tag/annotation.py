@@ -908,11 +908,10 @@ def gene_labels_from_adata(adata, gene_markers, tissue_tag_annotation, diameter,
         combined_gene_indices = set(combined_gene_indices)
 
         # Assign labels - find the annotation_id for the marker
-        label_value = None
-        for annotation_id in tissue_tag_annotation.annotation_map.index:
-            if tissue_tag_annotation.annotation_map.loc[annotation_id, 'annotation_label'] == marker:
-                label_value = annotation_id
-                break
+        matching_ids = tissue_tag_annotation.annotation_map[
+            tissue_tag_annotation.annotation_map['annotation_label'] == marker
+        ].index
+        label_value = matching_ids[0] if len(matching_ids) > 0 else None
 
         if label_value is not None:
             for coor in tissue_tag_annotation.positions.loc[list(combined_gene_indices), ["pxl_row", "pxl_col"]].to_numpy():
