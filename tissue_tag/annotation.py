@@ -328,10 +328,8 @@ def annotator(tissue_tag_annotation, plot_size=1024, invert_y=False, use_datasha
 
     render_dict = {}
     path_dict = {}
-    for _, row in tissue_tag_annotation.annotation_map.iterrows():
-        annotation_id = row['annotation_id']
-        label = row['annotation_label']
-        colour = row['annotation_colour']
+    for row in tissue_tag_annotation.annotation_map.itertuples():
+        annotation_id, label, colour = row
         path_dict[annotation_id] = hv.Path([]).opts(color=colour, line_width=5, line_alpha=0.7)
         render_dict[annotation_id] = CustomFreehandDraw(source=path_dict[annotation_id], num_objects=200, tooltip=label,
                                                icon_colour=colour)
@@ -432,9 +430,9 @@ def rgb_from_labels(tissue_tag_annotation):
     labelimage_rgb = np.zeros(
         (tissue_tag_annotation.label_image.shape[0], tissue_tag_annotation.label_image.shape[1], 4))
 
-    for _, row in tissue_tag_annotation.annotation_map.iterrows():
-        colour = ImageColor.getcolor(row['annotation_colour'], "RGBA")
-        labelimage_rgb[tissue_tag_annotation.label_image == row['annotation_id'], 0:4] = np.array(colour)
+    for row in tissue_tag_annotation.annotation_map.itertuples():
+        colour = ImageColor.getcolor(row.annotation_colour, "RGBA")
+        labelimage_rgb[tissue_tag_annotation.label_image == row.annotation_id, 0:4] = np.array(colour)
 
     return labelimage_rgb.astype('uint8')
 
@@ -1112,9 +1110,9 @@ def plot_cell_label_annotations(tissue_tag_annotation, cell_diameter=5.0, annota
     ax.imshow(base_img, origin='lower')
 
     marker_size_pixels = cell_diameter * tissue_tag_annotation.ppm
-    for _, row in tissue_tag_annotation.annotation_map.iterrows():
-        label = row['annotation_label']
-        colour = row['annotation_colour']
+    for row in tissue_tag_annotation.annotation_map.itertuples():
+        label = row.annotation_label
+        colour = row.annotation_colour
         selected_position = tissue_tag_annotation.positions[tissue_tag_annotation.positions[annotation_column] == label]
         zipped = np.broadcast(selected_position["pxl_col"], selected_position["pxl_row"], marker_size_pixels * 0.5)
         patches = [Circle((x_, y_), s_) for x_, y_, s_ in zipped]
