@@ -836,7 +836,7 @@ def gene_labels_from_adata(adata, gene_markers, tissue_tag_annotation, diameter,
     # Extract coordinates
     labels = background_labels_intensity(tissue_tag_annotation.label_image.shape[:2],
                                          imarray=tissue_tag_annotation.image, r=r,
-                                         intensity_threshold=intensity_threshold, space_every_spots=space_every_spots,
+                                         intensity_threshold=intensity_threshold, grid_unit_size=space_every_spots,
                                          label=1)
     mask = tissue_tag_annotation.label_image > 0
     labels[mask] = tissue_tag_annotation.label_image[mask]  # add old labels if these are not empty
@@ -845,10 +845,10 @@ def gene_labels_from_adata(adata, gene_markers, tissue_tag_annotation, diameter,
         normalize_total(adata)
 
     # Assign labels based on gene expression
-    for marker, gene_list in gene_markers.items():
+    for label, gene_list in gene_markers.items():
         # Get the expected color for the marker
-        marker_color = tissue_tag_annotation.annotation_map.get(marker, "N/A")
-        print(f"🧬 Processing marker: '{marker}' | Color: {marker_color} | Genes: {[gene for gene, _ in gene_list]}")
+        label_color = tissue_tag_annotation.annotation_map.get(label, "N/A")
+        print(f"🧬 Processing label: '{label}' | Color: {label_color} | Genes: {[gene for gene, _ in gene_list]}")
 
         combined_gene_indices = []
 
@@ -888,7 +888,7 @@ def gene_labels_from_adata(adata, gene_markers, tissue_tag_annotation, diameter,
 
         # Assign labels
         for idx, sub in enumerate(tissue_tag_annotation.annotation_map.keys()):
-            if sub == marker:
+            if sub == label:
                 label_value = idx
 
         for coor in tissue_tag_annotation.positions.loc[list(combined_gene_indices), ["pxl_row", "pxl_col"]].to_numpy():
@@ -899,7 +899,7 @@ def gene_labels_from_adata(adata, gene_markers, tissue_tag_annotation, diameter,
     return tissue_tag_annotation if copy else None
 
 
-def background_labels_intensity(shape, imarray, r, intensity_threshold=230, space_every_spots=10, label=1):
+def background_labels_intensity(shape, imarray, r, intensity_threshold=230, grid_unit_size=10, label=1):
     """
     Generate background labels based on intensity (bright pixels in brightfield images).
 
@@ -913,7 +913,7 @@ def background_labels_intensity(shape, imarray, r, intensity_threshold=230, spac
         Radius of the spots.
     intensity_threshold : int, optional
         Threshold above which pixels are considered background. Default is 230.
-    space_every_spots : int, optional
+    grid_unit_size : int, optional
         Spacing between background spots. Default is 10.
     label : int, optional
         Label value for background spots. Default is 1.
@@ -936,7 +936,7 @@ def background_labels_intensity(shape, imarray, r, intensity_threshold=230, spac
     background_mask = grayscale > intensity_threshold
 
     training_labels = np.zeros(shape, dtype=np.uint8)
-    grid = square_grid(r, shape, space_every_spots).T
+    grid = square_grid(r, shape, grid_unit_size).T
 
     print(imarray.shape)
 
@@ -950,7 +950,7 @@ def background_labels_intensity(shape, imarray, r, intensity_threshold=230, spac
     return training_labels
 
 
-def square_grid(spot_size, shape, space_every_spots):
+def square_grid(spot_size, shape, grid_unit_size):
     """
     Generate a square grid
 
@@ -960,7 +960,7 @@ def square_grid(spot_size, shape, space_every_spots):
         Size of the spots.
     shape : tuple
         Shape of the grid (height, width).
-    space_every_spots : int
+    grid_unit_size : int
         Spacing between background spots.
 
     Returns
@@ -969,8 +969,8 @@ def square_grid(spot_size, shape, space_every_spots):
         Array containing the coordinates of the grid.
     """
     # Define step sizes
-    dx = spot_size * space_every_spots  # Horizontal spacing
-    dy = spot_size * space_every_spots  # Vertical spacing
+    dx = spot_size * grid_unit_size  # Horizontal spacing
+    dy = spot_size * grid_unit_size  # Vertical spacing
 
     # Generate meshgrid for a square grid
     x_coords = np.arange(spot_size, shape[0] - spot_size, dx)

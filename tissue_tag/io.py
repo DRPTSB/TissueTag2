@@ -2,11 +2,11 @@ import json
 from dataclasses import dataclass
 from typing import Optional
 from pathlib import Path
+from collections import OrderedDict
 
 import matplotlib
 import numpy as np
 import pandas as pd
-import skimage.exposure
 from PIL import Image, ImageEnhance, ImageOps, ImageColor
 from matplotlib import pyplot as plt
 from matplotlib.patches import Circle
@@ -761,7 +761,8 @@ def plot_10x_spatial_image(
     plt.show()
 
 
-def import_geojson_annotation(geojson_path, ori_shape, im_shape, sort_features=True, flip_y_axis=False):
+def import_geojson_annotation(geojson_path, ori_shape, im_shape, sort_features=True, flip_y_axis=False,
+                              unassigned_colour="yellow"):
     """
     Converts a GeoJSON FeatureCollection into a 2D matrix using ONLY rasterio.
 
@@ -778,6 +779,8 @@ def import_geojson_annotation(geojson_path, ori_shape, im_shape, sort_features=T
         This is designed to deal with scenario where there are overlapping annotations.
     flip_y_axis: bool, optional
         Whether to flip the y-axis when loading in the image (default: False).
+    unassigned_colour : str, optional
+        Color for unassigned pixels. Default is "yellow".
 
 
     Returns
@@ -799,7 +802,7 @@ def import_geojson_annotation(geojson_path, ori_shape, im_shape, sort_features=T
     with open(geojson_path, "r") as f:
         geojson_obj = json.load(f)
 
-    annotation_map = {}
+    annotation_map = OrderedDict({"unassigned": unassigned_colour})
     for feature in geojson_obj['features']:
         geom = feature['geometry']
         props = feature.get('properties', {})
