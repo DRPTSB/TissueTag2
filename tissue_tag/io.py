@@ -814,7 +814,7 @@ def import_geojson_annotation(geojson_path, ori_shape, im_shape, sort_features=T
         feat_anno = classification.get("name", "Unclassified")
         feat_colour = classification.get("color", [255,255,255])
 
-        annotation_map[feat_anno] = "#{0:02x}{1:02x}{2:02x}00".format(*feat_colour)
+        annotation_map[feat_anno] = "#{0:02x}{1:02x}{2:02x}FF".format(*feat_colour)
 
         # Calculate bounding area
         minx, miny, maxx, maxy = features.bounds(geom)
