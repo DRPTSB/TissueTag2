@@ -426,7 +426,13 @@ def label_overlay(label_pipe, n_labels, palette, plot_size=1024, invert_y=False,
             visible_names = label_names if value is None else value
             hidden_values = [name_to_value[name] for name in label_names if name not in visible_names]
             if hidden_values:
-                data = np.where(np.isin(data, hidden_values), 0, data)
+                # A lookup-table remap (data -> lut[data]) is roughly an order of magnitude
+                # faster than np.where(np.isin(data, hidden_values), 0, data) for large images,
+                # since np.isin scales with len(hidden_values) * data.size whereas a LUT does a
+                # single vectorized gather regardless of how many labels are hidden.
+                lut = np.arange(MAX_LABELS + 1, dtype=data.dtype)
+                lut[hidden_values] = 0
+                data = lut[data]
             return label_image_element(data, invert_y=invert_y)
 
         anno = hv.DynamicMap(
@@ -755,6 +761,9 @@ def annotator(tissue_tag_annotation, plot_size=1024, invert_y=False, use_datasha
 
         tissue_tag_annotation.label_image = previous_labels.copy()
         label_pipe.send(tissue_tag_annotation.label_image)
+
+        for stream in render_dict.values():
+            clear_draw_stream(stream)
 
         revert_button.disabled = True
         update_button.disabled = False
@@ -1120,6 +1129,9 @@ def segmenter(tissue_tag_annotation, plot_size=1024, invert_y=False, use_datasha
         tissue_tag_annotation.label_image = previous_label.copy()
         tissue_tag_annotation.annotation_map = previous_annotation_map.copy()
         label_pipe.send(tissue_tag_annotation.label_image)
+
+        clear_draw_stream(draw_object)
+        clear_draw_stream(erase_object)
 
         revert_button.disabled = True
         update_button.disabled = False
