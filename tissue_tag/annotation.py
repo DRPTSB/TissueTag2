@@ -1,5 +1,6 @@
 import base64
 import copy as cp
+import json
 import logging
 import warnings
 from functools import partial
@@ -15,7 +16,7 @@ import pandas as pd
 import param
 import cv2
 from PIL import Image, ImageDraw, ImageFont, ImageColor
-from bokeh.models import FreehandDrawTool, PolyDrawTool
+from bokeh.models import CustomJSHover, FreehandDrawTool, HoverTool, PolyDrawTool
 from holoviews.operation import datashader as hd
 from holoviews.streams import Pipe
 from matplotlib import pyplot as plt
@@ -349,6 +350,39 @@ def label_image_element(data, invert_y=False):
     return hv.Image(arr, bounds=(0, 0, w, h), vdims=['label'])
 
 
+def label_hover_tool(label_names):
+    """
+    Build a HoverTool that shows the annotation *name* (e.g. "cortex") instead of the raw
+    integer label value baked into the label_image.
+
+    Parameters
+    ----------
+    label_names: list of str
+        Names of the labels in ``annotation_map`` order, so that ``label_names[i]`` is the name
+        of the label with value ``i + 1``. Value 0 (background/unannotated) is always mapped to
+        "background".
+
+    Returns
+    -------
+    bokeh.models.HoverTool
+        Hover tool whose tooltip resolves the underlying integer via a small JS lookup table,
+        so it reads e.g. "Annotation: cortex" rather than "image: 3", alongside the x/y
+        coordinates (matching the default 'hover' tool's tooltip).
+    """
+
+    names_json = json.dumps(['background'] + list(label_names))
+    formatter = CustomJSHover(code=f"""
+        var names = {names_json};
+        var v = Math.round(value);
+        if (v < 0 || v >= names.length) {{ return 'unknown'; }}
+        return names[v];
+    """)
+    return HoverTool(
+        tooltips=[('x', '$x'), ('y', '$y'), ('Annotation', '@image{custom}')],
+        formatters={'@image': formatter},
+    )
+
+
 def label_overlay(label_pipe, n_labels, palette, plot_size=1024, invert_y=False,
                   use_datashader=False, label_aggregator='max', opacity_widget=None,
                   visibility_widget=None, label_names=None):
@@ -464,7 +498,7 @@ def label_overlay(label_pipe, n_labels, palette, plot_size=1024, invert_y=False,
         aspect='equal',
         frame_height=int(plot_size),
         frame_width=int(plot_size),
-        tools=['hover'],
+        tools=[label_hover_tool(label_names)] if label_names is not None else ['hover'],
         backend_opts={"plot.toolbar_location": "left"},
     )
 
@@ -506,17 +540,40 @@ def label_visibility_toggle(annotation_map, always_visible=()):
         Object whose ``value`` List parameter holds the currently visible label names. Pass this
         as the ``visibility_widget`` argument to ``label_overlay``.
     ui: panel.FlexBox
-        The "Annotations:" label followed by one colour-swatch + checkbox per toggle-able label.
+        The "Annotations:" label, a "Select all" checkbox that shows/hides every label at once,
+        followed by one colour-swatch + checkbox per toggle-able label. The "Select all" checkbox
+        also reflects the aggregate state (checked only when every label is currently visible).
     """
 
     always_visible = list(always_visible)
     checkboxes = {}
-    items = [pn.widgets.StaticText(value='Annotations:', styles={'font-weight': 'bold'})]
+    select_all_toggle = pn.widgets.Checkbox(value=True, name='Select all', width=90)
+    items = [
+        pn.widgets.StaticText(value='Annotations:', styles={'font-weight': 'bold'}),
+        select_all_toggle,
+    ]
 
     state = _LabelVisibilityState(value=list(annotation_map.keys()))
 
+    _updating_toggle = [False]  # guard against recursive callbacks between toggle <-> checkboxes
+
     def _refresh(event=None):
         state.value = always_visible + [name for name, cb in checkboxes.items() if cb.value]
+        if not _updating_toggle[0]:
+            _updating_toggle[0] = True
+            select_all_toggle.value = all(cb.value for cb in checkboxes.values())
+            _updating_toggle[0] = False
+
+    def _toggle_all(event):
+        if _updating_toggle[0]:
+            return
+        _updating_toggle[0] = True
+        for cb in checkboxes.values():
+            cb.value = event.new
+        _updating_toggle[0] = False
+        _refresh()
+
+    select_all_toggle.param.watch(_toggle_all, 'value')
 
     for name, colour in annotation_map.items():
         if name in always_visible:
