@@ -556,8 +556,11 @@ def label_visibility_toggle(annotation_map, always_visible=()):
     state = _LabelVisibilityState(value=list(annotation_map.keys()))
 
     _updating_toggle = [False]  # guard against recursive callbacks between toggle <-> checkboxes
+    _bulk_update = [False]  # guard to skip per-checkbox _refresh work during "Select all" toggling
 
     def _refresh(event=None):
+        if _bulk_update[0]:
+            return
         state.value = always_visible + [name for name, cb in checkboxes.items() if cb.value]
         if not _updating_toggle[0]:
             _updating_toggle[0] = True
@@ -568,8 +571,19 @@ def label_visibility_toggle(annotation_map, always_visible=()):
         if _updating_toggle[0]:
             return
         _updating_toggle[0] = True
-        for cb in checkboxes.values():
-            cb.value = event.new
+        _bulk_update[0] = True
+        # Batch all checkbox updates into a single document/websocket push instead of one
+        # per checkbox, which is what caused the visible sequential toggling with a delay.
+        # `hold` combines the underlying Bokeh document events, while `block_comm` stops each
+        # checkbox from eagerly pushing its own change over the notebook comm; `push_notebook`
+        # then flushes everything as one message so all checkboxes (un)tick simultaneously.
+        checkbox_list = list(checkboxes.values())
+        with pn.io.hold(pn.state.curdoc), pn.io.block_comm():
+            for cb in checkbox_list:
+                cb.value = event.new
+        if checkbox_list:
+            pn.io.push_notebook(*checkbox_list)
+        _bulk_update[0] = False
         _updating_toggle[0] = False
         _refresh()
 
