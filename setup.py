@@ -35,6 +35,7 @@ setup(
     ],
     extras_require={
         "geojson": ["rasterio"],
+        "file_backed": ["xarray", "dask[array]", "zarr>=3", "dask-ml"],
     },
     author='Oren Amsalem, Nadav Yayon, Andrian Yang',
     author_email='ny1@sanger.ac.uk',

@@ -2,12 +2,14 @@ import base64
 import copy as cp
 import json
 import logging
+import tempfile
 import warnings
 from functools import partial
 from io import BytesIO
 from collections import OrderedDict
 
 import bokeh
+import datashader as ds
 import holoviews as hv
 import matplotlib.font_manager as fm
 import numpy as np
@@ -60,6 +62,43 @@ MAX_LABELS = np.iinfo(DEFAULT_LABEL_DTYPE).max
 
 # Colours cycled through when the segmenter creates new objects.
 SEGMENTER_COLORPOOL = ['green', 'cyan', 'brown', 'magenta', 'blue', 'red', 'orange']
+
+# Per-task memory budget (bytes), used to patch datashader's Canvas.raster() (see below) so
+# that regridding a file-backed (dask/Zarr-backed) image or label overlay stays low-RAM.
+REGRID_MAX_MEM_BYTES = 64 * 1024 * 1024  # 64MB
+
+_original_canvas_raster = ds.Canvas.raster
+
+
+def _low_ram_canvas_raster(self, source, *args, **kwargs):
+    """
+    Wraps `datashader.Canvas.raster` to default `max_mem` (see `REGRID_MAX_MEM_BYTES`) whenever
+    the caller doesn't specify one -- in particular, holoviews' `regrid` operation, which
+    `label_image_overlay`/`base_image_element` use for file-backed rendering, never passes
+    `max_mem`/`chunksize` itself (checked against holoviews 1.22.0).
+
+    Why this matters: without a `max_mem` budget, datashader's `compute_chunksize` (see
+    `datashader.resampling`) falls back to using the source array's *own* dask chunksize
+    verbatim as the OUTPUT-space chunk grid. Our on-disk Zarr chunks are ~2048px
+    (`file_backed.DEFAULT_CHUNKS`), far larger than a typical downsampled overview (a few
+    hundred px) -- so that fallback collapses the "chunked" resample into a single task
+    spanning the *entire* source array, silently pulling a whole 35000x35000 image into RAM
+    regardless of viewport/zoom (confirmed by measuring resident memory directly; the resulting
+    *displayed* image is still correctly downsampled, but getting there materialised everything
+    once). Passing `max_mem` switches datashader onto its adaptive path instead, which derives a
+    chunk size fine enough that each task's corresponding input region provably stays under the
+    budget, regardless of how the source array happens to be chunked on disk or how large the
+    downsampling ratio is.
+
+    Harmless for plain-numpy (non-dask) sources -- `max_mem` is only consulted on the dask-array
+    branch of `raster()` -- and for callers that already pass their own `max_mem`/`chunksize`.
+    """
+
+    kwargs.setdefault('max_mem', REGRID_MAX_MEM_BYTES)
+    return _original_canvas_raster(self, source, *args, **kwargs)
+
+
+ds.Canvas.raster = _low_ram_canvas_raster
 
 
 class CustomFreehandDraw(hv.streams.FreehandDraw):
@@ -426,14 +465,25 @@ def build_annotation_toggle_widget(annotation_map):
     return state, ui
 
 
+def _is_xarray_backed(data):
+    """
+    Whether `data` is a lazy, dask-backed xarray.DataArray (i.e. produced by
+    `tissue_tag.file_backed`) rather than a plain in-memory numpy array.
+    """
+
+    return hasattr(data, 'dims') and hasattr(data, 'coords')
+
+
 def label_image_element(data, invert_y=False):
     """
     Helper function to wrap a 2D label_image into an hv.Image
 
     Parameters
     ----------
-    data: numpy.ndarray
-        2D integer array of label values.
+    data: numpy.ndarray or xarray.DataArray
+        2D integer array of label values. May be a lazy, dask-backed
+        xarray.DataArray (see `tissue_tag.file_backed`), in which case the
+        flip is a cheap lazy re-index and no full-resolution copy is made.
     invert_y: bool, optional
         Invert plot along y axis. Default is False.
 
@@ -442,6 +492,10 @@ def label_image_element(data, invert_y=False):
     holoviews.Image
         Image element with a single 'label' value dimension.
     """
+
+    if _is_xarray_backed(data):
+        arr = data if invert_y else data[::-1]
+        return hv.Image(arr, kdims=['x', 'y'], vdims=['label'])
 
     arr = data if invert_y else np.ascontiguousarray(data[::-1])
     h, w = arr.shape
@@ -519,7 +573,14 @@ def label_image_overlay(label_pipe, palette, plot_size=1024, invert_y=False,
             if hidden_values:
                 lut = np.arange(np.iinfo(data.dtype).max + 1, dtype=data.dtype)
                 lut[hidden_values] = 0
-                data = lut[data]
+                if _is_xarray_backed(data):
+                    # Apply the LUT chunk-by-chunk so masking a file-backed
+                    # label image never materialises the full array in RAM.
+                    import xarray as xr
+                    masked = data.data.map_blocks(lambda block: lut[block], dtype=data.dtype)
+                    data = xr.DataArray(masked, dims=data.dims, coords=data.coords)
+                else:
+                    data = lut[data]
             return label_image_element(data, invert_y=invert_y)
 
         anno = hv.DynamicMap(
@@ -568,8 +629,11 @@ def base_image_element(image, plot_size=1024, invert_y=False, use_datashader=Fal
 
     Parameters
     ----------
-    image: numpy.ndarray
-        RGB(A) base image.
+    image: numpy.ndarray or xarray.DataArray
+        RGB(A) base image. May be a lazy, dask-backed xarray.DataArray (see
+        `tissue_tag.file_backed`), in which case this function never
+        materialises the full-resolution image; `regrid`/datashader only
+        pulls in the pixels needed for the current viewport and zoom level.
     plot_size: int, optional
         Figure size for plotting. Default is 1024.
     invert_y: bool, optional
@@ -583,11 +647,17 @@ def base_image_element(image, plot_size=1024, invert_y=False, use_datashader=Fal
         The base image layer.
     """
 
-    imarray_c = image.astype('uint8')
-    if not invert_y:
-        imarray_c = np.flip(imarray_c, 0)
+    if _is_xarray_backed(image):
+        imarray_c = image if image.dtype == np.uint8 else image.astype('uint8')
+        if not invert_y:
+            imarray_c = imarray_c[::-1]
+        img = hv.RGB(imarray_c, kdims=['x', 'y'], vdims=list(imarray_c.coords['band'].values))
+    else:
+        imarray_c = image.astype('uint8')
+        if not invert_y:
+            imarray_c = np.flip(imarray_c, 0)
+        img = hv.RGB(imarray_c, bounds=(0, 0, imarray_c.shape[1], imarray_c.shape[0]))
 
-    img = hv.RGB(imarray_c, bounds=(0, 0, imarray_c.shape[1], imarray_c.shape[0]))
     if use_datashader:
         img = hd.regrid(img)
 
@@ -626,10 +696,66 @@ def clear_draw_stream(stream):
                       "idempotently on the next update.")
 
 
+def _write_polygon_strokes_file_backed(writer, strokes):
+    """
+    Commit a batch of drawn polygon strokes directly onto an on-disk label
+    store, one bounding-box-scoped read/write per stroke, so committing an
+    Update never requires materialising (or copying) the full label image in
+    RAM -- only the small region each stroke actually touches.
+
+    Parameters
+    ----------
+    writer: file_backed.WritableLabelStore
+        Writable handle onto the on-disk label Zarr store.
+    strokes: list of (xs, ys, label_value)
+        One entry per drawn stroke: the bokeh draw-tool's raw x/y vertex
+        lists and the label value to paint that stroke's interior with (0
+        for an eraser stroke).
+
+    Returns
+    -------
+    list of (y0, y1, x0, x1, previous_block)
+        The pre-write contents of every block actually written, in write
+        order -- pass to :func:`_revert_polygon_strokes_file_backed` (in
+        reverse) to undo exactly this batch.
+    """
+
+    written = []
+    for xs, ys, label_value in strokes:
+        x = np.array(xs).astype(int)
+        y = np.array(ys).astype(int)
+        rr, cc = polygon(y, x)
+        inshape = (writer.shape[0] > rr) & (0 < rr) & (writer.shape[1] > cc) & (0 < cc)
+        rr_in, cc_in = rr[inshape], cc[inshape]
+        if rr_in.size == 0:
+            continue
+
+        y0, y1 = int(rr_in.min()), int(rr_in.max()) + 1
+        x0, x1 = int(cc_in.min()), int(cc_in.max()) + 1
+
+        prev_block = writer.read_block(y0, y1, x0, x1)
+        written.append((y0, y1, x0, x1, prev_block))
+
+        new_block = prev_block.copy()
+        new_block[rr_in - y0, cc_in - x0] = label_value
+        writer.write_block(y0, y1, x0, x1, new_block)
+
+    return written
+
+
+def _revert_polygon_strokes_file_backed(writer, written_blocks):
+    """Undo a batch produced by :func:`_write_polygon_strokes_file_backed`,
+    restoring each touched block in reverse write order."""
+
+    for y0, y1, x0, x1, block in reversed(written_blocks):
+        writer.write_block(y0, y1, x0, x1, block)
+
+
 # Annotation functions
 
 def annotator(tissue_tag_annotation, plot_size=1024, invert_y=False, use_datashader=False,
-              unassigned_colour="yellow", annotation_aggregator='max', clear_paths_on_update=True):
+              unassigned_colour="yellow", annotation_aggregator='max', clear_paths_on_update=True,
+              file_backed=False, work_dir=None):
     """
     Interactive annotation tool with line annotations using Panel for switching between morphology and annotation.
 
@@ -655,6 +781,17 @@ def annotator(tissue_tag_annotation, plot_size=1024, invert_y=False, use_datasha
         Default is 'max', which keeps thin strokes visible at low zoom.
     clear_paths_on_update : bool, optional
         Clear the drawn strokes once they have been committed to the label image. Default is True.
+    file_backed : bool, optional
+        Keep ``image``/``label_image`` on disk (Zarr, via ``tissue_tag.file_backed``) rather than
+        fully in RAM. Rendering flows through datashader's ``regrid`` so only the current viewport
+        is materialised, and each Update writes only the bounding box of the drawn strokes straight
+        to the on-disk label store -- the process never holds a second full-resolution copy of
+        either array. If ``tissue_tag_annotation`` is already file-backed (see
+        ``TissueTagAnnotation.to_file_backed``) this is inferred automatically. Default is False.
+    work_dir : str, optional
+        Directory to hold the on-disk Zarr stores when ``file_backed`` triggers a fresh conversion.
+        Defaults to a new temporary directory. Ignored if ``tissue_tag_annotation`` is already
+        file-backed.
 
     Returns
     -------
@@ -671,7 +808,16 @@ def annotator(tissue_tag_annotation, plot_size=1024, invert_y=False, use_datasha
         tissue_tag_annotation.annotation_map["unassigned"] = unassigned_colour
         tissue_tag_annotation.annotation_map.move_to_end("unassigned", last=False)
 
-    if tissue_tag_annotation.label_image is None:
+    use_file_backed = file_backed or tissue_tag_annotation.file_backed
+    if use_file_backed:
+        if not tissue_tag_annotation.file_backed:
+            tissue_tag_annotation.to_file_backed(work_dir or tempfile.mkdtemp())
+        else:
+            # to_file_backed() already calls this; also cover objects that were made
+            # file-backed by direct field assignment rather than via that method.
+            from tissue_tag import file_backed as fb
+            fb.configure_dask_for_low_ram()
+    elif tissue_tag_annotation.label_image is None:
         # An all-zero label image simply renders as nothing, so the previous
         # {'default': '#00000000'} placeholder annotation_map is no longer needed.
         tissue_tag_annotation.label_image = np.zeros(
@@ -718,36 +864,49 @@ def annotator(tissue_tag_annotation, plot_size=1024, invert_y=False, use_datasha
         tab_object,
     )
 
-    previous_labels = tissue_tag_annotation.label_image.copy()
+    previous_labels = None if use_file_backed else tissue_tag_annotation.label_image.copy()
+    previous_blocks = []  # file-backed only: (y0, y1, x0, x1, previous_block) from the last Update
 
     def update_annotator(event):
-        nonlocal previous_labels
+        nonlocal previous_labels, previous_blocks
 
         if not event:
             return
 
         update_button.disabled = True
 
-        previous_labels = tissue_tag_annotation.label_image.copy()
-        # Work on a copy: param compares old/new values, so pushing the same array object back
-        # through the Pipe may not fire a redraw.
-        updated_labels = tissue_tag_annotation.label_image.copy()
-        for idx, a in enumerate(render_dict.keys()):
-            if render_dict[a].data['xs']:
-                for o in range(len(render_dict[a].data['xs'])):
-                    x = np.array(render_dict[a].data['xs'][o]).astype(int)
-                    y = np.array(render_dict[a].data['ys'][o]).astype(int)
-                    rr, cc = polygon(y, x)
-                    inshape = np.where(
-                        np.array(tissue_tag_annotation.label_image.shape[0] > rr) & np.array(0 < rr) & np.array(
-                            tissue_tag_annotation.label_image.shape[1] > cc) & np.array(
-                            0 < cc))[0]
-                    updated_labels[rr[inshape], cc[inshape]] = idx + 1
+        if use_file_backed:
+            strokes = [
+                (render_dict[a].data['xs'][o], render_dict[a].data['ys'][o], idx + 1)
+                for idx, a in enumerate(render_dict.keys())
+                if render_dict[a].data['xs']
+                for o in range(len(render_dict[a].data['xs']))
+            ]
+            writer = tissue_tag_annotation.label_writer()
+            previous_blocks = _write_polygon_strokes_file_backed(writer, strokes)
+            tissue_tag_annotation.refresh_label_view()
+            label_pipe.send(tissue_tag_annotation.label_image)
+        else:
+            previous_labels = tissue_tag_annotation.label_image.copy()
+            # Work on a copy: param compares old/new values, so pushing the same array object back
+            # through the Pipe may not fire a redraw.
+            updated_labels = tissue_tag_annotation.label_image.copy()
+            for idx, a in enumerate(render_dict.keys()):
+                if render_dict[a].data['xs']:
+                    for o in range(len(render_dict[a].data['xs'])):
+                        x = np.array(render_dict[a].data['xs'][o]).astype(int)
+                        y = np.array(render_dict[a].data['ys'][o]).astype(int)
+                        rr, cc = polygon(y, x)
+                        inshape = np.where(
+                            np.array(tissue_tag_annotation.label_image.shape[0] > rr) & np.array(0 < rr) & np.array(
+                                tissue_tag_annotation.label_image.shape[1] > cc) & np.array(
+                                0 < cc))[0]
+                        updated_labels[rr[inshape], cc[inshape]] = idx + 1
 
-        tissue_tag_annotation.label_image = updated_labels
+            tissue_tag_annotation.label_image = updated_labels
 
-        # This single line replaces rgb_from_labels() + create_images() + pn.panel() rebuild.
-        label_pipe.send(updated_labels)
+            # This single line replaces rgb_from_labels() + create_images() + pn.panel() rebuild.
+            label_pipe.send(updated_labels)
 
         if clear_paths_on_update:
             for stream in render_dict.values():
@@ -762,8 +921,14 @@ def annotator(tissue_tag_annotation, plot_size=1024, invert_y=False, use_datasha
 
         update_button.disabled = True
 
-        tissue_tag_annotation.label_image = previous_labels.copy()
-        label_pipe.send(tissue_tag_annotation.label_image)
+        if use_file_backed:
+            writer = tissue_tag_annotation.label_writer()
+            _revert_polygon_strokes_file_backed(writer, previous_blocks)
+            tissue_tag_annotation.refresh_label_view()
+            label_pipe.send(tissue_tag_annotation.label_image)
+        else:
+            tissue_tag_annotation.label_image = previous_labels.copy()
+            label_pipe.send(tissue_tag_annotation.label_image)
 
         for stream in render_dict.values():
             clear_draw_stream(stream)
@@ -777,6 +942,48 @@ def annotator(tissue_tag_annotation, plot_size=1024, invert_y=False, use_datasha
     return p
 
 
+def _ensure_in_memory(tissue_tag_annotation):
+    """
+    Materialize a file-backed ``TissueTagAnnotation``'s ``image``/``label_image`` into plain
+    in-memory numpy arrays, in place, before handing off to a function that is not chunk-aware.
+
+    This is a deliberate, documented scope boundary: the pixel classifier (feature extraction in
+    particular), the median filter, and a couple of other numpy-only helpers have not been
+    rewritten to operate chunk-by-chunk on dask/Zarr-backed data, so they still need the full
+    array resident in RAM -- same as today's ``downsampling_factor`` option is used to manage
+    that cost. Everything on the annotator/segmenter/viewing path stays low-RAM regardless; only
+    these specific numpy-only operations fall back to materialising here. No-op if
+    ``tissue_tag_annotation`` is not file-backed.
+
+    Parameters
+    ----------
+    tissue_tag_annotation: TissueTagAnnotation
+
+    Returns
+    -------
+    TissueTagAnnotation
+        ``tissue_tag_annotation``, for chaining. Callers that want to preserve a file-backed
+        original should pass a ``copy=True``'d object into this function (as every caller below
+        does), not the caller's own reference.
+    """
+
+    if not tissue_tag_annotation.file_backed:
+        return tissue_tag_annotation
+
+    warnings.warn(
+        "This operation is not chunk-aware and will load the full image/label_image into RAM "
+        "(equivalent to the in-memory pipeline's peak usage for this step); see "
+        "tissue_tag.file_backed and the file_backed docs on annotator/segmenter for the parts "
+        "of the pipeline that stay low-RAM."
+    )
+    tissue_tag_annotation.image = np.asarray(tissue_tag_annotation.image)
+    if tissue_tag_annotation.label_image is not None:
+        tissue_tag_annotation.label_image = np.asarray(tissue_tag_annotation.label_image)
+    tissue_tag_annotation.image_store = None
+    tissue_tag_annotation.label_store = None
+    return tissue_tag_annotation
+
+
 def rgb_from_labels(tissue_tag_annotation):
     """
     Helper function to generate colored annotation image from label image and annotation map.
@@ -787,6 +994,9 @@ def rgb_from_labels(tissue_tag_annotation):
 
     The intermediate array is now allocated as uint8 rather than float64, which cuts peak memory
     for this function by 8x (a 20k x 20k label image previously allocated ~12.8 GB here).
+
+    NOTE: not chunk-aware -- if ``tissue_tag_annotation`` is file-backed, this materialises the
+    full label_image into RAM (see ``_ensure_in_memory``).
 
     Parameters
     ----------
@@ -799,15 +1009,20 @@ def rgb_from_labels(tissue_tag_annotation):
         Annotation image.
     """
 
+    # Read-only: materialise a local numpy view without mutating the caller's (possibly
+    # file-backed) object, unlike the classifier/median_filter/... helpers below which already
+    # have copy=False/True semantics that make an in-place materialisation expected.
+    label_image = np.asarray(tissue_tag_annotation.label_image)
+
     labelimage_rgb = np.zeros(
-        (tissue_tag_annotation.label_image.shape[0], tissue_tag_annotation.label_image.shape[1], 4),
+        (label_image.shape[0], label_image.shape[1], 4),
         dtype=np.uint8
     )
 
     colours = list(tissue_tag_annotation.annotation_map.values())
     for c in range(len(colours)):
         color = ImageColor.getcolor(colours[c], "RGBA")
-        labelimage_rgb[tissue_tag_annotation.label_image == c + 1, 0:4] = np.array(color, dtype=np.uint8)
+        labelimage_rgb[label_image == c + 1, 0:4] = np.array(color, dtype=np.uint8)
 
     return labelimage_rgb
 
@@ -836,6 +1051,13 @@ def pixel_label_classifier(tissue_tag_annotation, classifier="RandomForest", thr
     None | TissueTagAnnotation
         TissueTagAnnotation object with updated label_image based on the classifier prediction if copy is True,
         otherwise None.
+
+    Notes
+    -----
+    Known scope limitation: feature extraction (``skimage.feature.multiscale_basic_features``)
+    is not chunk-aware, so this always materialises the (optionally downsampled) image/label_image
+    fully in RAM, even for a file-backed ``tissue_tag_annotation`` (see ``_ensure_in_memory``).
+    Use ``downsampling_factor`` to manage peak memory on very large images.
     """
 
     def predict_segmenter_thresholded(features, clf, threshold):
@@ -873,6 +1095,7 @@ def pixel_label_classifier(tissue_tag_annotation, classifier="RandomForest", thr
         raise ValueError("Classifier is not supported. Currently supported classifiers are RandomForest and LogisticRegression.")
 
     tissue_tag_annotation = cp.deepcopy(tissue_tag_annotation) if copy else tissue_tag_annotation
+    tissue_tag_annotation = _ensure_in_memory(tissue_tag_annotation)
 
     print("[INFO] Initializing classifier...")
     sigma_min = 1
@@ -981,11 +1204,13 @@ def plot_labels(tissue_tag_annotation, alpha=0.8):
     """
 
     annotation = rgb_from_labels(tissue_tag_annotation)
-    return overlay_labels(tissue_tag_annotation.image, annotation, alpha, show=True)
+    # Read-only preview plot: materialise a local numpy view (see rgb_from_labels) without
+    # mutating a file-backed tissue_tag_annotation.
+    return overlay_labels(np.asarray(tissue_tag_annotation.image), annotation, alpha, show=True)
 
 
 def segmenter(tissue_tag_annotation, plot_size=1024, invert_y=False, use_datashader=False,
-              annotation_prefix="object", label_aggregator='max'):
+              annotation_prefix="object", label_aggregator='max', file_backed=False, work_dir=None):
     """
     Interactive annotation tool to segment image using Panel to switch between morphology and annotation.
 
@@ -1014,6 +1239,14 @@ def segmenter(tissue_tag_annotation, plot_size=1024, invert_y=False, use_datasha
     label_aggregator : str, optional
         Reduction used to downsample the label image when zoomed out. See ``label_image_overlay``.
         Default is 'max'.
+    file_backed : bool, optional
+        Keep ``image``/``label_image`` on disk (Zarr, via ``tissue_tag.file_backed``) rather than
+        fully in RAM. See ``annotator`` for details; the same bounding-box-scoped write/undo
+        applies here to both drawn objects and eraser strokes. Default is False.
+    work_dir : str, optional
+        Directory to hold the on-disk Zarr stores when ``file_backed`` triggers a fresh conversion.
+        Defaults to a new temporary directory. Ignored if ``tissue_tag_annotation`` is already
+        file-backed.
 
     Returns
     -------
@@ -1021,7 +1254,19 @@ def segmenter(tissue_tag_annotation, plot_size=1024, invert_y=False, use_datasha
         A panel application object with segmenter tool.
     """
 
-    if tissue_tag_annotation.label_image is None:
+    label_was_missing = tissue_tag_annotation.label_image is None and not tissue_tag_annotation.file_backed
+    use_file_backed = file_backed or tissue_tag_annotation.file_backed
+    if use_file_backed:
+        if not tissue_tag_annotation.file_backed:
+            tissue_tag_annotation.to_file_backed(work_dir or tempfile.mkdtemp())
+        else:
+            # to_file_backed() already calls this; also cover objects that were made
+            # file-backed by direct field assignment rather than via that method.
+            from tissue_tag import file_backed as fb
+            fb.configure_dask_for_low_ram()
+        if label_was_missing:
+            tissue_tag_annotation.annotation_map = OrderedDict({})
+    elif label_was_missing:
         tissue_tag_annotation.label_image = np.zeros(
             (tissue_tag_annotation.image.shape[0], tissue_tag_annotation.image.shape[1]),
             dtype=DEFAULT_LABEL_DTYPE
@@ -1064,33 +1309,23 @@ def segmenter(tissue_tag_annotation, plot_size=1024, invert_y=False, use_datasha
     tab_object = pn.panel(hv.Overlay(plot_list).collate())
     p = pn.Column(pn.Row(label_image_opacity, update_button, revert_button), tab_object)
 
-    previous_label = tissue_tag_annotation.label_image.copy()
+    previous_label = None if use_file_backed else tissue_tag_annotation.label_image.copy()
     previous_annotation_map = tissue_tag_annotation.annotation_map.copy()
+    previous_blocks = []  # file-backed only: (y0, y1, x0, x1, previous_block) from the last Update
 
     def update_segmenter(event):
-        nonlocal previous_label, previous_annotation_map
+        nonlocal previous_label, previous_annotation_map, previous_blocks
 
         if not event:
             return
 
         update_button.disabled = True
 
-        previous_label = tissue_tag_annotation.label_image.copy()
         previous_annotation_map = tissue_tag_annotation.annotation_map.copy()
-
-        updated_labels = tissue_tag_annotation.label_image.copy()
 
         existing_object_count = len(tissue_tag_annotation.annotation_map.keys()) + 1
 
-        if erase_object.data['xs']:
-            for o in range(len(erase_object.data['xs'])):
-                x = np.array(erase_object.data['xs'][o]).astype(int)
-                y = np.array(erase_object.data['ys'][o]).astype(int)
-                rr, cc = polygon(y, x)
-                inshape = (updated_labels.shape[0] > rr) & (0 < rr) & \
-                          (updated_labels.shape[1] > cc) & (0 < cc)
-                updated_labels[rr[inshape], cc[inshape]] = 0
-
+        new_object_strokes = []
         if draw_object.data['xs']:
             for o in range(len(draw_object.data['xs'])):
                 label_value = existing_object_count + o
@@ -1101,12 +1336,7 @@ def segmenter(tissue_tag_annotation, plot_size=1024, invert_y=False, use_datasha
                     )
                     break
 
-                x = np.array(draw_object.data['xs'][o]).astype(int)
-                y = np.array(draw_object.data['ys'][o]).astype(int)
-                rr, cc = polygon(y, x)
-                inshape = (updated_labels.shape[0] > rr) & (0 < rr) & \
-                          (updated_labels.shape[1] > cc) & (0 < cc)
-                updated_labels[rr[inshape], cc[inshape]] = label_value
+                new_object_strokes.append((draw_object.data['xs'][o], draw_object.data['ys'][o], label_value))
 
                 # Record the colour this object was actually drawn in, taken from the fixed
                 # palette rather than picked at random, so annotation_map and the rendered
@@ -1115,8 +1345,39 @@ def segmenter(tissue_tag_annotation, plot_size=1024, invert_y=False, use_datasha
                     f"{annotation_prefix}_{label_value}"
                 ] = palette[label_value - 1]
 
-        tissue_tag_annotation.label_image = updated_labels
-        label_pipe.send(updated_labels)
+        if use_file_backed:
+            # Erase strokes first, then new objects -- same order the in-memory path applies them.
+            erase_strokes = [
+                (erase_object.data['xs'][o], erase_object.data['ys'][o], 0)
+                for o in range(len(erase_object.data['xs']))
+            ] if erase_object.data['xs'] else []
+            writer = tissue_tag_annotation.label_writer()
+            previous_blocks = _write_polygon_strokes_file_backed(writer, erase_strokes + new_object_strokes)
+            tissue_tag_annotation.refresh_label_view()
+            label_pipe.send(tissue_tag_annotation.label_image)
+        else:
+            previous_label = tissue_tag_annotation.label_image.copy()
+            updated_labels = tissue_tag_annotation.label_image.copy()
+
+            if erase_object.data['xs']:
+                for o in range(len(erase_object.data['xs'])):
+                    x = np.array(erase_object.data['xs'][o]).astype(int)
+                    y = np.array(erase_object.data['ys'][o]).astype(int)
+                    rr, cc = polygon(y, x)
+                    inshape = (updated_labels.shape[0] > rr) & (0 < rr) & \
+                              (updated_labels.shape[1] > cc) & (0 < cc)
+                    updated_labels[rr[inshape], cc[inshape]] = 0
+
+            for xs, ys, label_value in new_object_strokes:
+                x = np.array(xs).astype(int)
+                y = np.array(ys).astype(int)
+                rr, cc = polygon(y, x)
+                inshape = (updated_labels.shape[0] > rr) & (0 < rr) & \
+                          (updated_labels.shape[1] > cc) & (0 < cc)
+                updated_labels[rr[inshape], cc[inshape]] = label_value
+
+            tissue_tag_annotation.label_image = updated_labels
+            label_pipe.send(updated_labels)
 
         clear_draw_stream(draw_object)
         clear_draw_stream(erase_object)
@@ -1130,8 +1391,13 @@ def segmenter(tissue_tag_annotation, plot_size=1024, invert_y=False, use_datasha
 
         update_button.disabled = True
 
-        tissue_tag_annotation.label_image = previous_label.copy()
         tissue_tag_annotation.annotation_map = previous_annotation_map.copy()
+        if use_file_backed:
+            writer = tissue_tag_annotation.label_writer()
+            _revert_polygon_strokes_file_backed(writer, previous_blocks)
+            tissue_tag_annotation.refresh_label_view()
+        else:
+            tissue_tag_annotation.label_image = previous_label.copy()
         label_pipe.send(tissue_tag_annotation.label_image)
 
         clear_draw_stream(draw_object)
@@ -1183,6 +1449,7 @@ def gene_labels_from_adata(adata, gene_markers, tissue_tag_annotation, diameter,
     """
 
     tissue_tag_annotation = cp.deepcopy(tissue_tag_annotation) if copy else tissue_tag_annotation
+    tissue_tag_annotation = _ensure_in_memory(tissue_tag_annotation)
 
     if tissue_tag_annotation.label_image is not None:
         print("Label image is not empty.")
@@ -1384,6 +1651,7 @@ def median_filter(tissue_tag_annotation, filter_radius=10, downsampling_factor=1
     from skimage.morphology import disk
 
     tissue_tag_annotation = cp.deepcopy(tissue_tag_annotation) if copy else tissue_tag_annotation
+    tissue_tag_annotation = _ensure_in_memory(tissue_tag_annotation)
     label_image_shape = tissue_tag_annotation.label_image.shape
     r = int(filter_radius * tissue_tag_annotation.ppm)
 
@@ -1429,6 +1697,10 @@ def assign_annotation_label_to_positions(tissue_tag_annotation, annotation_colum
         raise ValueError("Positions data frame is missing. Please provide positions data frame.")
 
     tissue_tag_annotation = cp.deepcopy(tissue_tag_annotation) if copy else tissue_tag_annotation
+    # get_annotations_for_objects() below indexes label_image with paired integer arrays
+    # (numpy "fancy" indexing); an xarray-backed label_image would instead perform outer-product
+    # indexing there, silently giving wrong results, so this must be plain numpy.
+    tissue_tag_annotation = _ensure_in_memory(tissue_tag_annotation)
 
     coord_df = tissue_tag_annotation.positions[["pxl_row", "pxl_col"]].rename(columns={"pxl_row":"x", "pxl_col":"y"})
     tissue_tag_annotation.positions[annotation_column] = get_annotations_for_objects(tissue_tag_annotation, coord_df)

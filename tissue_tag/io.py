@@ -1,4 +1,5 @@
 import json
+import os
 from dataclasses import dataclass
 from typing import Optional
 from pathlib import Path
@@ -24,10 +25,103 @@ class TissueTagAnnotation:
     annotation_map: Optional[dict] = None
     positions: Optional[pd.DataFrame] = None
     grid: Optional[pd.DataFrame] = None
+    # Paths to on-disk Zarr stores backing `image`/`label_image` once `to_file_backed()`
+    # has been called. When set, `image`/`label_image` hold lazy, dask-backed
+    # xarray.DataArray *views* of these stores rather than plain numpy arrays.
+    # See tissue_tag.file_backed for details; this is entirely opt-in and unset
+    # (None) for the default in-memory numpy pipeline.
+    image_store: Optional[str] = None
+    label_store: Optional[str] = None
+
+    @property
+    def file_backed(self):
+        """Whether image/label_image are lazy, on-disk Zarr-backed views rather than plain numpy arrays."""
+        return self.image_store is not None or self.label_store is not None
+
+    def to_file_backed(self, work_dir, chunks=None, overwrite=True):
+        """
+        Persist `image` (and `label_image`, creating an all-zero one on disk if
+        absent) to on-disk Zarr stores under `work_dir`, and switch this object
+        over to lazy, dask-backed views of those stores.
+
+        This is a one-time conversion: the source numpy arrays are streamed to
+        disk chunk-by-chunk and then dropped, so from this point on the process
+        never needs to hold a second full-resolution copy of the image or label
+        image simultaneously. Safe to call on an already file-backed object
+        (no-op for whichever of image/label_image is already backed).
+
+        Parameters
+        ----------
+        work_dir : str
+            Directory to hold the `image.zarr` / `label.zarr` stores.
+        chunks : tuple of int, optional
+            On-disk chunk size along (y, x). Defaults to `file_backed.DEFAULT_CHUNKS`.
+        overwrite : bool, optional
+            Overwrite pre-existing stores of the same name in `work_dir`. Default True.
+
+        Returns
+        -------
+        TissueTagAnnotation
+            self, for chaining.
+        """
+        from tissue_tag import file_backed as fb
+
+        fb.configure_dask_for_low_ram()
+        chunks = fb.DEFAULT_CHUNKS if chunks is None else chunks
+        os.makedirs(work_dir, exist_ok=True)
+
+        if self.image_store is None:
+            image_path = os.path.join(work_dir, "image.zarr")
+            fb.array_to_zarr(np.asarray(self.image), image_path, chunks=chunks, overwrite=overwrite)
+            self.image_store = image_path
+        self.image = fb.image_dataarray(self.image_store)
+
+        if self.label_store is None:
+            label_path = os.path.join(work_dir, "label.zarr")
+            if self.label_image is None:
+                shape = (int(self.image.sizes['y']), int(self.image.sizes['x']))
+                fb.zeros_zarr(shape, label_path, chunks=chunks, overwrite=overwrite)
+            else:
+                fb.array_to_zarr(np.asarray(self.label_image), label_path, chunks=chunks, overwrite=overwrite)
+            self.label_store = label_path
+        self.label_image = fb.label_dataarray(self.label_store)
+
+        return self
+
+    def label_writer(self):
+        """
+        Return a `file_backed.WritableLabelStore` bound to this object's
+        on-disk label store, for bbox-scoped in-place writes that never
+        require materialising the full label image in RAM.
+
+        Requires `to_file_backed()` to have been called first.
+        """
+        from tissue_tag import file_backed as fb
+
+        if self.label_store is None:
+            raise ValueError("TissueTagAnnotation is not file-backed; call to_file_backed() first.")
+        return fb.WritableLabelStore(self.label_store)
+
+    def refresh_label_view(self):
+        """
+        Rebuild the lazy `label_image` view from the on-disk store, so it
+        reflects writes made through a `label_writer()` handle since the view
+        was last built.
+        """
+        from tissue_tag import file_backed as fb
+
+        self.label_image = fb.label_dataarray(self.label_store)
+        return self.label_image
 
     def save_annotation(self, file_path):
         """
         Saves the TissueTagAnnotation object into HDF5 file.
+
+        If file-backed (`image_store`/`label_store` set), `image`/`label_image` already live in
+        their own on-disk Zarr stores, so only the store *paths* are written here rather than
+        re-serialising the (potentially huge) arrays into this HDF5 file. `load_annotation` then
+        reopens them as lazy views. The Zarr stores themselves are not moved/copied by this call --
+        keep them alongside `file_path` if you intend to relocate the annotation.
 
         Parameters
         ----------
@@ -35,11 +129,15 @@ class TissueTagAnnotation:
             Path to the HDF5 file.
         """
         with h5py.File(file_path, 'w') as f:
-            if self.image is not None:
+            if self.image_store is not None:
+                f.create_dataset('image_store', data=str(self.image_store))
+            elif self.image is not None:
                 f.create_dataset('image', data=self.image)
             if self.ppm is not None:
                 f.create_dataset('ppm', data=self.ppm)
-            if self.label_image is not None:
+            if self.label_store is not None:
+                f.create_dataset('label_store', data=str(self.label_store))
+            elif self.label_image is not None:
                 f.create_dataset('label_image', data=self.label_image)
             if self.annotation_map is not None:
                 f.create_dataset('annotation_map', data=json.dumps(self.annotation_map))
@@ -49,9 +147,22 @@ class TissueTagAnnotation:
             self.grid.to_hdf(file_path, key="positions", mode="a")
 
 
+def _read_h5_str(dataset):
+    """h5py returns fixed/variable-length string scalars as either str or bytes
+    depending on version; normalise to str."""
+    value = dataset[()]
+    return value.decode() if isinstance(value, bytes) else value
+
+
 def load_annotation(file_path):
     """
     Loads the TissueTagAnnotation object from an HDF5 file.
+
+    If the annotation was saved from a file-backed `TissueTagAnnotation` (see
+    `TissueTagAnnotation.to_file_backed`), `image`/`label_image` are reopened as lazy,
+    dask-backed views onto their on-disk Zarr stores rather than being read fully into RAM.
+    This requires the Zarr stores saved alongside the original HDF5 file to still be present
+    at the recorded paths.
 
     Parameters
     ----------
@@ -64,6 +175,8 @@ def load_annotation(file_path):
         The loaded TissueTagAnnotation object.
     """
     with h5py.File(file_path, 'r') as f:
+        image_store = _read_h5_str(f['image_store']) if 'image_store' in f else None
+        label_store = _read_h5_str(f['label_store']) if 'label_store' in f else None
         image = f['image'][:] if 'image' in f else None
         ppm = f['ppm'][()] if 'ppm' in f else None
         label_image = f['label_image'][:] if 'label_image' in f else None
@@ -75,12 +188,24 @@ def load_annotation(file_path):
         if 'grid' in f:
             grid = pd.read_hdf(file_path, key="grid")
 
-    if image is not None:
-        print(f'> loaded image - size - {str(image.shape)}')
+    if image_store is not None or label_store is not None:
+        from tissue_tag import file_backed as fb
+
+        fb.configure_dask_for_low_ram()
+        if image_store is not None:
+            image = fb.image_dataarray(image_store)
+            print(f'> loaded image as a lazy, file-backed view of {image_store!r}')
+        if label_store is not None:
+            label_image = fb.label_dataarray(label_store)
+            print(f'> loaded label image as a lazy, file-backed view of {label_store!r}')
+    else:
+        if image is not None:
+            print(f'> loaded image - size - {str(image.shape)}')
+        if label_image is not None:
+            print(f'> loaded label image - size - {str(label_image.shape)}')
+
     if ppm is not None:
         print(f'> loaded ppm: {ppm}')
-    if label_image is not None:
-        print(f'> loaded label image - size - {str(label_image.shape)}')
     if annotation_map is not None:
         print(f'> loaded annotation map:')
         print(annotation_map)
@@ -88,7 +213,7 @@ def load_annotation(file_path):
         print('> loaded positions')
     if grid is not None:
         print('> loaded grid')
-    return TissueTagAnnotation(image, ppm, label_image, annotation_map, positions, grid)
+    return TissueTagAnnotation(image, ppm, label_image, annotation_map, positions, grid, image_store, label_store)
 
 
 def read_image(
