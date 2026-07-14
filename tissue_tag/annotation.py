@@ -753,7 +753,7 @@ def _revert_polygon_strokes_file_backed(writer, written_blocks):
 
 def annotator(tissue_tag_annotation, plot_size=1024, invert_y=False, use_datashader=False,
               unassigned_colour="yellow", annotation_aggregator='max', clear_paths_on_update=True,
-              file_backed=False, work_dir=None):
+              file_backed=False, file_backed_dir=None):
     """
     Interactive annotation tool with line annotations using Panel for switching between morphology and annotation.
 
@@ -786,7 +786,7 @@ def annotator(tissue_tag_annotation, plot_size=1024, invert_y=False, use_datasha
         to the on-disk label store -- the process never holds a second full-resolution copy of
         either array. If ``tissue_tag_annotation`` is already file-backed (see
         ``TissueTagAnnotation.to_file_backed``) this is inferred automatically. Default is False.
-    work_dir : str, optional
+    file_backed_dir : str, optional
         Directory to hold the on-disk Zarr stores when ``file_backed`` triggers a fresh conversion.
         Defaults to a new temporary directory. Ignored if ``tissue_tag_annotation`` is already
         file-backed.
@@ -809,7 +809,7 @@ def annotator(tissue_tag_annotation, plot_size=1024, invert_y=False, use_datasha
     use_file_backed = file_backed or tissue_tag_annotation.file_backed
     if use_file_backed:
         if not tissue_tag_annotation.file_backed:
-            tissue_tag_annotation.to_file_backed(work_dir or tempfile.mkdtemp())
+            tissue_tag_annotation.to_file_backed(file_backed_dir or tempfile.mkdtemp())
         else:
             # to_file_backed() already calls this; also cover objects that were made
             # file-backed by direct field assignment rather than via that method.
@@ -1208,7 +1208,7 @@ def plot_labels(tissue_tag_annotation, alpha=0.8):
 
 
 def segmenter(tissue_tag_annotation, plot_size=1024, invert_y=False, use_datashader=False,
-              annotation_prefix="object", label_aggregator='max', file_backed=False, work_dir=None):
+              annotation_prefix="object", label_aggregator='max', file_backed=False, file_backed_dir=None):
     """
     Interactive annotation tool to segment image using Panel to switch between morphology and annotation.
 
@@ -1241,7 +1241,7 @@ def segmenter(tissue_tag_annotation, plot_size=1024, invert_y=False, use_datasha
         Keep ``image``/``label_image`` on disk (Zarr, via ``tissue_tag.file_backed``) rather than
         fully in RAM. See ``annotator`` for details; the same bounding-box-scoped write/undo
         applies here to both drawn objects and eraser strokes. Default is False.
-    work_dir : str, optional
+    file_backed_dir : str, optional
         Directory to hold the on-disk Zarr stores when ``file_backed`` triggers a fresh conversion.
         Defaults to a new temporary directory. Ignored if ``tissue_tag_annotation`` is already
         file-backed.
@@ -1256,7 +1256,7 @@ def segmenter(tissue_tag_annotation, plot_size=1024, invert_y=False, use_datasha
     use_file_backed = file_backed or tissue_tag_annotation.file_backed
     if use_file_backed:
         if not tissue_tag_annotation.file_backed:
-            tissue_tag_annotation.to_file_backed(work_dir or tempfile.mkdtemp())
+            tissue_tag_annotation.to_file_backed(file_backed_dir or tempfile.mkdtemp())
         else:
             # to_file_backed() already calls this; also cover objects that were made
             # file-backed by direct field assignment rather than via that method.

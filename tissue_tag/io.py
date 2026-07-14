@@ -1,5 +1,6 @@
 import json
 import os
+import tempfile
 from dataclasses import dataclass
 from typing import Optional
 from pathlib import Path
@@ -38,10 +39,10 @@ class TissueTagAnnotation:
         """Whether image/label_image are lazy, on-disk Zarr-backed views rather than plain numpy arrays."""
         return self.image_store is not None or self.label_store is not None
 
-    def to_file_backed(self, work_dir, chunks=None, overwrite=True):
+    def to_file_backed(self, file_backed_dir, chunks=None, overwrite=True):
         """
         Persist `image` (and `label_image`, creating an all-zero one on disk if
-        absent) to on-disk Zarr stores under `work_dir`, and switch this object
+        absent) to on-disk Zarr stores under `file_backed_dir`, and switch this object
         over to lazy, dask-backed views of those stores.
 
         This is a one-time conversion: the source numpy arrays are streamed to
@@ -52,12 +53,12 @@ class TissueTagAnnotation:
 
         Parameters
         ----------
-        work_dir : str
+        file_backed_dir : str
             Directory to hold the `image.zarr` / `label.zarr` stores.
         chunks : tuple of int, optional
             On-disk chunk size along (y, x). Defaults to `file_backed.DEFAULT_CHUNKS`.
         overwrite : bool, optional
-            Overwrite pre-existing stores of the same name in `work_dir`. Default True.
+            Overwrite pre-existing stores of the same name in `file_backed_dir`. Default True.
 
         Returns
         -------
@@ -68,16 +69,16 @@ class TissueTagAnnotation:
 
         fb.configure_dask_for_low_ram()
         chunks = fb.DEFAULT_CHUNKS if chunks is None else chunks
-        os.makedirs(work_dir, exist_ok=True)
+        os.makedirs(file_backed_dir, exist_ok=True)
 
         if self.image_store is None:
-            image_path = os.path.join(work_dir, "image.zarr")
+            image_path = os.path.join(file_backed_dir, "image.zarr")
             fb.array_to_zarr(np.asarray(self.image), image_path, chunks=chunks, overwrite=overwrite)
             self.image_store = image_path
         self.image = fb.image_dataarray(self.image_store)
 
         if self.label_store is None:
-            label_path = os.path.join(work_dir, "label.zarr")
+            label_path = os.path.join(file_backed_dir, "label.zarr")
             if self.label_image is None:
                 shape = (int(self.image.sizes['y']), int(self.image.sizes['x']))
                 fb.zeros_zarr(shape, label_path, chunks=chunks, overwrite=overwrite)
@@ -216,6 +217,41 @@ def load_annotation(file_path):
     return TissueTagAnnotation(image, ppm, label_image, annotation_map, positions, grid, image_store, label_store)
 
 
+def _finalize_annotation(tissue_tag_annotation, file_backed=False, file_backed_dir=None, chunks=None):
+    """
+    Shared tail for the read_* functions below: optionally convert a freshly-loaded
+    TissueTagAnnotation to file-backed (on-disk Zarr) storage before returning it.
+
+    The decoded image is still built fully in memory first -- PIL/tifffile have no chunked
+    reader for PNG/JPEG, and the various read_* functions may need the whole array in memory
+    anyway to do contrast enhancement, vH&E blending, or channel stacking -- but when
+    `file_backed=True` it is persisted to disk and dropped immediately afterward, so the process
+    never holds it alongside a second full-resolution copy later on (annotator/segmenter,
+    classifier, ...).
+
+    Parameters
+    ----------
+    tissue_tag_annotation : TissueTagAnnotation
+    file_backed : bool, optional
+        Convert `image`/`label_image` to lazy, on-disk Zarr-backed views (see
+        `TissueTagAnnotation.to_file_backed`) before returning. Default False.
+    file_backed_dir : str, optional
+        Directory for the on-disk Zarr stores. If not specified, a new temporary directory is
+        used. Ignored if `file_backed` is False.
+    chunks : tuple of int, optional
+        On-disk chunk size along (y, x). Defaults to `file_backed.DEFAULT_CHUNKS`.
+
+    Returns
+    -------
+    TissueTagAnnotation
+    """
+    if file_backed:
+        file_backed_dir = file_backed_dir or tempfile.mkdtemp(prefix="tissue_tag_")
+        tissue_tag_annotation.to_file_backed(file_backed_dir, chunks=chunks)
+        print(f'> converted to file-backed mode, Zarr stores under {file_backed_dir!r}')
+    return tissue_tag_annotation
+
+
 def read_image(
     path,
     ppm_image = None,
@@ -225,6 +261,8 @@ def read_image(
     flip_y_axis = False,
     annotation_file = None,
     plot = True,
+    file_backed = False,
+    file_backed_dir = None,
 ) -> TissueTagAnnotation:
     """
     Reads an H&E or fluorescent image and returns the image with optional enhancements.
@@ -251,6 +289,12 @@ def read_image(
         Path to GeoJSON object containing annotation features. Expects GeoJSON object in the structure of QuPath GeoJSON output.
     plot : boolean, optional
         if to plot the loaded image. Defaults to True.
+    file_backed : bool, optional
+        Return a file-backed (on-disk Zarr, low-RAM) TissueTagAnnotation instead of an
+        in-memory one. Requires the 'file_backed' extra. Default False.
+    file_backed_dir : str, optional
+        Directory for the on-disk Zarr stores when `file_backed` is True. If not specified, a
+        new temporary directory is used. Ignored if `file_backed` is False.
 
     Returns
     -------
@@ -304,7 +348,8 @@ def read_image(
     else:
         label_image, annotation_map = None, None
 
-    return TissueTagAnnotation(image=im, ppm=ppm_out, label_image=label_image, annotation_map=annotation_map)
+    tissue_tag_annotation = TissueTagAnnotation(image=im, ppm=ppm_out, label_image=label_image, annotation_map=annotation_map)
+    return _finalize_annotation(tissue_tag_annotation, file_backed=file_backed, file_backed_dir=file_backed_dir)
 
 
 def read_visium(
@@ -316,6 +361,8 @@ def read_visium(
     flip_y_axis = False,
     annotation_file = None,
     plot = False,
+    file_backed = False,
+    file_backed_dir = None,
 ) -> TissueTagAnnotation:
     """
     Reads 10X Visium data from SpaceRanger.
@@ -342,6 +389,12 @@ def read_visium(
         Path to GeoJSON object containing annotation features. Expects GeoJSON object in the structure of QuPath GeoJSON output.
     plot : bool, optional
         Whether to plot the output image (default: False).
+    file_backed : bool, optional
+        Return a file-backed (on-disk Zarr, low-RAM) TissueTagAnnotation instead of an
+        in-memory one. Requires the 'file_backed' extra. Default False.
+    file_backed_dir : str, optional
+        Directory for the on-disk Zarr stores when `file_backed` is True. If not specified, a
+        new temporary directory is used. Ignored if `file_backed` is False.
 
 
     Returns
@@ -424,7 +477,8 @@ def read_visium(
     else:
         label_image, annotation_map = None, None
 
-    return TissueTagAnnotation(image=im, ppm=ppm_anno, label_image=label_image, annotation_map=annotation_map, positions=df)
+    tissue_tag_annotation = TissueTagAnnotation(image=im, ppm=ppm_anno, label_image=label_image, annotation_map=annotation_map, positions=df)
+    return _finalize_annotation(tissue_tag_annotation, file_backed=file_backed, file_backed_dir=file_backed_dir)
 
 def read_visium_hd(
     spaceranger_dir_path,
@@ -436,6 +490,8 @@ def read_visium_hd(
     flip_y_axis = False,
     annotation_file = None,
     plot = False,
+    file_backed = False,
+    file_backed_dir = None,
 ) -> TissueTagAnnotation:
     """
     Reads 10X Visium HD data from SpaceRanger, including spatial image and metadata.
@@ -463,6 +519,12 @@ def read_visium_hd(
         Path to GeoJSON object containing annotation features. Expects GeoJSON object in the structure of QuPath GeoJSON output.
     plot : bool, optional
         Whether to plot the output image. Defaults to False.
+    file_backed : bool, optional
+        Return a file-backed (on-disk Zarr, low-RAM) TissueTagAnnotation instead of an
+        in-memory one. Requires the 'file_backed' extra. Default False.
+    file_backed_dir : str, optional
+        Directory for the on-disk Zarr stores when `file_backed` is True. If not specified, a
+        new temporary directory is used. Ignored if `file_backed` is False.
 
 
     Returns
@@ -551,8 +613,9 @@ def read_visium_hd(
     else:
         label_image, annotation_map = None, None
 
-    return TissueTagAnnotation(image=im, ppm=ppm_anno, label_image=label_image, annotation_map=annotation_map,
+    tissue_tag_annotation = TissueTagAnnotation(image=im, ppm=ppm_anno, label_image=label_image, annotation_map=annotation_map,
                                positions=df)
+    return _finalize_annotation(tissue_tag_annotation, file_backed=file_backed, file_backed_dir=file_backed_dir)
 
 def read_xenium(
     xeniumranger_dir_path,
@@ -564,6 +627,8 @@ def read_xenium(
     flip_y_axis = False,
     annotation_file = None,
     plot = False,
+    file_backed = False,
+    file_backed_dir = None,
 ) -> TissueTagAnnotation:
     """
     Reads 10X Xenium data from XeniumRanger, including spatial image and metadata.
@@ -592,6 +657,12 @@ def read_xenium(
         Path to GeoJSON object containing annotation features. Expects GeoJSON object in the structure of QuPath GeoJSON output.
     plot : bool, optional
         Whether to plot the output image. Defaults to False.
+    file_backed : bool, optional
+        Return a file-backed (on-disk Zarr, low-RAM) TissueTagAnnotation instead of an
+        in-memory one. Requires the 'file_backed' extra. Default False.
+    file_backed_dir : str, optional
+        Directory for the on-disk Zarr stores when `file_backed` is True. If not specified, a
+        new temporary directory is used. Ignored if `file_backed` is False.
 
 
     Returns
@@ -706,7 +777,8 @@ def read_xenium(
         label_image, annotation_map = None, None
 
 
-    return TissueTagAnnotation(image=stacked_im, ppm=ppm_out, label_image=label_image, annotation_map=annotation_map, positions=df)
+    tissue_tag_annotation = TissueTagAnnotation(image=stacked_im, ppm=ppm_out, label_image=label_image, annotation_map=annotation_map, positions=df)
+    return _finalize_annotation(tissue_tag_annotation, file_backed=file_backed, file_backed_dir=file_backed_dir)
 
 
 def simonson_vHE(dapi_image, eosin_image):

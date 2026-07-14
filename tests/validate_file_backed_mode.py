@@ -182,7 +182,7 @@ def run(work_dir, side, threshold_mb):
 
         # --- Step 2: build + render annotator elements (datashader regrid) ---
         t0 = time.time()
-        app = annotator(tta, plot_size=512, use_datashader=True, file_backed=True, work_dir=work_dir)
+        app = annotator(tta, plot_size=512, use_datashader=True, file_backed=True, file_backed_dir=work_dir)
         row = app[0]
         update_button, revert_button = row[1], row[2]
         hv.render(app[2].object)
