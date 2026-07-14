@@ -51,8 +51,12 @@ MIN_DATASHADER = '0.6.0'
 # Fully transparent colour used for label value 0 (unannotated background) and NaN.
 TRANSPARENT = 'rgba(0, 0, 0, 0)'
 
-# Maximum number of distinct labels representable in a uint8 label_image.
-MAX_LABELS = 255
+# Default dtype used when a new label_image is created from scratch.
+DEFAULT_LABEL_DTYPE = np.uint8
+
+# Fallback maximum number of distinct labels, used only when no label_image dtype is available
+# yet. Once a label_image exists, its dtype's actual range (via np.iinfo) is used instead.
+MAX_LABELS = np.iinfo(DEFAULT_LABEL_DTYPE).max
 
 # Colours cycled through when the segmenter creates new objects.
 SEGMENTER_COLORPOOL = ['green', 'cyan', 'brown', 'magenta', 'blue', 'red', 'orange']
@@ -149,15 +153,16 @@ hv.plotting.bokeh.callbacks.Stream._callbacks['bokeh'].update({
     CustomPolyDraw: CustomPolyDrawCallback
 })
 
-# Monkeypatch CDSCallback.initialize (the common base class for every draw-tool callback -
-# FreehandDraw, PolyDraw, PolyEdit and our Custom* variants all end up calling it, directly or via
-# super()) so that each stream keeps a reference to the *live* bokeh ColumnDataSource backing its
-# glyph. `clear_draw_stream` below uses this to reset the strokes actually rendered in the browser,
-# rather than only the python-side copy of the data.
+
 _original_cds_callback_initialize = hv.plotting.bokeh.callbacks.CDSCallback.initialize
 
+def _custom_cds_callback_initializer(self, plot_id=None):
+    """
+    This custom initialiser for CDSCallback (the common base class for every draw-tool callback)
+    allows each stream to keep a reference to the bokeh ColumnDataSource backing its glyph so we
+    can clear it from the backend.
+    """
 
-def _cds_callback_initialize_with_stash(self, plot_id=None):
     _original_cds_callback_initialize(self, plot_id)
     cds = self.plot.handles.get('source')
     if cds is not None:
@@ -165,7 +170,8 @@ def _cds_callback_initialize_with_stash(self, plot_id=None):
             stream._draw_cds = cds
 
 
-hv.plotting.bokeh.callbacks.CDSCallback.initialize = _cds_callback_initialize_with_stash
+# Overload CDSCallback.initialize to use the custom initialiser.
+hv.plotting.bokeh.callbacks.CDSCallback.initialize = _custom_cds_callback_initializer
 
 
 def to_base64(img):
@@ -277,35 +283,14 @@ def create_icon(name, colour):
     return image
 
 
-# ---------------------------------------------------------------------------
-# Native label rendering helpers
-#
-# Rather than baking an RGBA array with rgb_from_labels() and handing that to
-# holoviews as an hv.RGB, the label_image is passed straight through as an
-# hv.Image and coloured by the *plot options* (cmap + clim + color_levels).
-#
-# Consequences:
-#   * the label_image stays the single source of truth; a redraw is a
-#     Pipe.send() rather than an O(H*W*4) array rebuild,
-#   * colours can be changed without regenerating any pixel data,
-#   * the underlying integer values survive to the browser, so hover works,
-#   * downsampling is done with a label-aware aggregator instead of averaging
-#     colour channels (which silently invents boundary colours).
-# ---------------------------------------------------------------------------
-
-def hex_palette_from_annotation_map(annotation_map):
+def hex_palette_generator(annotation_map):
     """
-    Convert an annotation map into a list of hex colours suitable for use as a holoviews cmap.
-
-    The returned palette is ordered so that ``palette[i]`` is the colour for label value ``i + 1``,
-    matching the convention used by ``rgb_from_labels`` and by the annotator/segmenter label
-    assignment (label 0 == unannotated background).
+    Helper function to generate a list of hex colours from annotation_map values.
 
     Parameters
     ----------
     annotation_map: dict
-        Mapping of annotation name to colour. Colours may be any string PIL's ImageColor
-        understands (e.g. "yellow", "#ff0000", "rgb(255,0,0)").
+        Mapping of annotation name to colour.
 
     Returns
     -------
@@ -320,47 +305,15 @@ def hex_palette_from_annotation_map(annotation_map):
     return palette
 
 
-def label_image_element(data, invert_y=False):
+def annotation_label_hover_tool(label_names):
     """
-    Wrap a 2D integer label image in an hv.Image with pixel bounds.
-
-    IMPORTANT: the first parameter MUST be named ``data``. This function is used as the callback
-    of a DynamicMap driven by a holoviews Pipe, and a Pipe's own parameter is called ``data``, so
-    holoviews invokes the callback as ``callback(data=<label_image>)``. Renaming this argument to
-    something more descriptive (e.g. ``label_image``) raises
-    ``TypeError: got an unexpected keyword argument 'data'`` on the first render. This is the same
-    reason the canonical holoviews example ``hv.DynamicMap(hv.Curve, streams=[pipe])`` works:
-    ``Curve``'s first argument is also called ``data``.
-
-    Parameters
-    ----------
-    data: numpy.ndarray
-        2D integer array of label values.
-    invert_y: bool, optional
-        Invert plot along y axis. Default is False.
-
-    Returns
-    -------
-    holoviews.Image
-        Image element with a single 'label' value dimension.
-    """
-
-    arr = data if invert_y else np.ascontiguousarray(data[::-1])
-    h, w = arr.shape
-    return hv.Image(arr, bounds=(0, 0, w, h), vdims=['label'])
-
-
-def label_hover_tool(label_names):
-    """
-    Build a HoverTool that shows the annotation *name* (e.g. "cortex") instead of the raw
-    integer label value baked into the label_image.
+    Custom HoverTool to show annotation name instead of the integer label value in label_image.
 
     Parameters
     ----------
     label_names: list of str
         Names of the labels in ``annotation_map`` order, so that ``label_names[i]`` is the name
-        of the label with value ``i + 1``. Value 0 (background/unannotated) is always mapped to
-        "background".
+        of the label with value ``i + 1``. Value 0 (special value) is always mapped to "background".
 
     Returns
     -------
@@ -383,169 +336,35 @@ def label_hover_tool(label_names):
     )
 
 
-def label_overlay(label_pipe, n_labels, palette, plot_size=1024, invert_y=False,
-                  use_datashader=False, label_aggregator='max', opacity_widget=None,
-                  visibility_widget=None, label_names=None):
+def build_annotation_toggle_widget(annotation_map):
     """
-    Build the dynamic, natively-coloured annotation overlay.
-
-    The overlay is driven by a Pipe stream carrying the current label_image, so pushing a new
-    label_image redraws the annotation *without* rebuilding the bokeh plot. This preserves the
-    user's zoom/pan across updates.
-
-    Parameters
-    ----------
-    label_pipe: holoviews.streams.Pipe
-        Pipe carrying the current 2D integer label_image.
-    n_labels: int
-        Number of distinct (non-background) labels the palette covers.
-    palette: list of str
-        Hex colours, where palette[i] is the colour for label value i + 1.
-    plot_size: int, optional
-        Figure size for plotting. Default is 1024.
-    invert_y: bool, optional
-        Invert plot along y axis. Default is False.
-    use_datashader: bool, optional
-        Use datashader regridding. Recommended for high resolution images. Default is False.
-    label_aggregator: str, optional
-        Datashader reduction used when several label pixels fall into one screen pixel.
-        Only used when use_datashader is True. Default is 'max'.
-
-        - 'max'  : any labelled pixel beats background, so thin strokes stay visible when
-                   zoomed out. Ties within a screen pixel resolve to the highest label value.
-        - 'mode' : majority label wins, which is area-accurate but makes sparse strokes
-                   disappear at low zoom (they lose the vote to background).
-        - 'first' / 'last' / 'min' are also accepted.
-
-        NOTE: do NOT use the datashader default of 'mean'. Averaging label 1 and label 3 gives
-        label 2, which invents classes that were never annotated.
-    opacity_widget: panel.widgets.FloatSlider, optional
-        Slider whose value drives the overlay alpha. Default is None.
-    visibility_widget: panel.widgets.CheckBoxGroup, optional
-        Checkbox group whose ``value`` (the list of currently *checked* names) controls which
-        labels are shown. Unchecked labels are masked out of the rendered overlay (their pixels
-        are treated as background/transparent) without touching the underlying label_image.
-        Must be used together with ``label_names``. Default is None (all labels always shown).
-    label_names: list of str, optional
-        Names of the labels in ``annotation_map`` order, so that ``label_names[i]`` is the name
-        of the label with value ``i + 1``. Required if ``visibility_widget`` is given.
-
-    Returns
-    -------
-    holoviews.DynamicMap
-        The annotation overlay, ready to be composed into an Overlay.
-    """
-
-    # Verified against holoviews 1.22.0 / datashader 0.18.2:
-    #   holoviews regrid._process does
-    #       agg_fn = self._get_aggregator(element, add_field=False)
-    #       rarray = cvs.raster(xarr, upsample_method=interp, downsample_method=agg_fn)
-    #   so the string is resolved via AggregationOperation._agg_methods (which contains
-    #   any/count/first/last/mode/mean/sum/var/std/min/max/count_cat) into a datashader Reduction,
-    #   and then passed to Canvas.raster. Canvas.raster only accepts the *resampling* reductions
-    #   (first/last/mean/mode/var/std/min/max) -- count/any/sum are NOT valid there -- so the
-    #   whitelist below is deliberately narrower than holoviews' own.
-    valid_aggregators = ('max', 'mode', 'min', 'first', 'last')
-    if label_aggregator not in valid_aggregators:
-        raise ValueError(
-            f"label_aggregator must be one of {valid_aggregators!r}, got {label_aggregator!r}. "
-            "In particular 'mean' (the datashader default) is invalid here: averaging label "
-            "values produces classes that were never annotated, e.g. mean(1, 3) == 2."
-        )
-
-    if visibility_widget is not None and label_names is not None:
-        name_to_value = {name: idx + 1 for idx, name in enumerate(label_names)}
-
-        def mask_hidden_labels(data, value):
-            visible_names = label_names if value is None else value
-            hidden_values = [name_to_value[name] for name in label_names if name not in visible_names]
-            if hidden_values:
-                # A lookup-table remap (data -> lut[data]) is roughly an order of magnitude
-                # faster than np.where(np.isin(data, hidden_values), 0, data) for large images,
-                # since np.isin scales with len(hidden_values) * data.size whereas a LUT does a
-                # single vectorized gather regardless of how many labels are hidden.
-                lut = np.arange(MAX_LABELS + 1, dtype=data.dtype)
-                lut[hidden_values] = 0
-                data = lut[data]
-            return label_image_element(data, invert_y=invert_y)
-
-        anno = hv.DynamicMap(
-            mask_hidden_labels,
-            streams=[label_pipe, hv.streams.Params(parameters=[visibility_widget.param.value])]
-        )
-    else:
-        anno = hv.DynamicMap(partial(label_image_element, invert_y=invert_y), streams=[label_pipe])
-
-    if use_datashader:
-        anno = hd.regrid(
-            anno,
-            aggregator=label_aggregator,
-            interpolation='nearest',   # never blend label values when upsampling
-            upsample=True,
-        )
-
-    anno = anno.opts(
-        cmap=palette,
-        # Bin edges land on the half-integers, so integer label value v maps to palette[v - 1].
-        clim=(0.5, n_labels + 0.5),
-        # Discrete bins: stops the colormapper interpolating between neighbouring label colours.
-        color_levels=n_labels,
-        # Label 0 (background) falls below the clim floor and is clipped to fully transparent.
-        # This is done at the colormapper level rather than via `nodata`, so it works whether
-        # regrid hands back an integer or a float array.
-        clipping_colors={'min': TRANSPARENT, 'NaN': TRANSPARENT},
-        colorbar=False,
-        aspect='equal',
-        frame_height=int(plot_size),
-        frame_width=int(plot_size),
-        tools=[label_hover_tool(label_names)] if label_names is not None else ['hover'],
-        backend_opts={"plot.toolbar_location": "left"},
-    )
-
-    if opacity_widget is not None:
-        anno = anno.apply.opts(alpha=opacity_widget.param.value)
-
-    return anno
-
-
-class _LabelVisibilityState(param.Parameterized):
-    """
-    Tiny param object exposing the list of currently visible label names.
-
-    Used instead of ``pn.widgets.CheckBoxGroup`` so the "Annotations:" toggle row can have a
-    custom layout (colour swatch + name next to each checkbox) while still exposing a single
-    ``.param.value`` that ``label_overlay`` can react to as a ``visibility_widget``.
-    """
-
-    value = param.List(default=[])
-
-
-def label_visibility_toggle(annotation_map, always_visible=()):
-    """
-    Build a "Annotations:" row of per-label checkboxes, each preceded by a small colour swatch
-    matching that label's colour in ``annotation_map``, for interactively hiding/showing labels
-    in the rendered overlay.
+    Helper function to build a custom widget to allow user to toggle visibility of individual annotations
+    from ``annotation_map`` in the rendered overlay.
 
     Parameters
     ----------
     annotation_map: dict
         Mapping of annotation name to colour.
-    always_visible: iterable of str, optional
-        Label names to omit from the checkbox row (e.g. "unassigned") that should nonetheless
-        always count as visible, so they are never masked out of the overlay. Default is ``()``.
 
     Returns
     -------
     state: param.Parameterized
         Object whose ``value`` List parameter holds the currently visible label names. Pass this
         as the ``visibility_widget`` argument to ``label_overlay``.
-    ui: panel.FlexBox
+    widget_ui: panel.FlexBox
         The "Annotations:" label, a "Select all" checkbox that shows/hides every label at once,
         followed by one colour-swatch + checkbox per toggle-able label. The "Select all" checkbox
         also reflects the aggregate state (checked only when every label is currently visible).
     """
 
-    always_visible = list(always_visible)
+    class _AnnotationVisibilityState(param.Parameterized):
+        """
+        Custom param object exposing the list of currently visible label names, replicating how the
+        ``pn.widgets.CheckBoxGroup`` works for defining what is visible.
+        """
+
+        value = param.List(default=[])
+
     checkboxes = {}
     select_all_toggle = pn.widgets.Checkbox(value=True, name='Select all', width=90)
     items = [
@@ -553,7 +372,7 @@ def label_visibility_toggle(annotation_map, always_visible=()):
         select_all_toggle,
     ]
 
-    state = _LabelVisibilityState(value=list(annotation_map.keys()))
+    state = _AnnotationVisibilityState(value=list(annotation_map.keys()))
 
     _updating_toggle = [False]  # guard against recursive callbacks between toggle <-> checkboxes
     _bulk_update = [False]  # guard to skip per-checkbox _refresh work during "Select all" toggling
@@ -561,7 +380,7 @@ def label_visibility_toggle(annotation_map, always_visible=()):
     def _refresh(event=None):
         if _bulk_update[0]:
             return
-        state.value = always_visible + [name for name, cb in checkboxes.items() if cb.value]
+        state.value = [name for name, cb in checkboxes.items() if cb.value]
         if not _updating_toggle[0]:
             _updating_toggle[0] = True
             select_all_toggle.value = all(cb.value for cb in checkboxes.values())
@@ -572,6 +391,7 @@ def label_visibility_toggle(annotation_map, always_visible=()):
             return
         _updating_toggle[0] = True
         _bulk_update[0] = True
+
         # Batch all checkbox updates into a single document/websocket push instead of one
         # per checkbox, which is what caused the visible sequential toggling with a delay.
         # `hold` combines the underlying Bokeh document events, while `block_comm` stops each
@@ -590,8 +410,6 @@ def label_visibility_toggle(annotation_map, always_visible=()):
     select_all_toggle.param.watch(_toggle_all, 'value')
 
     for name, colour in annotation_map.items():
-        if name in always_visible:
-            continue
         cb = pn.widgets.Checkbox(value=True, name='', width=18)
         swatch = pn.pane.HTML(
             f'<div style="width:14px; height:14px; background-color:{colour}; '
@@ -608,17 +426,150 @@ def label_visibility_toggle(annotation_map, always_visible=()):
     return state, ui
 
 
-def reference_image_element(image, plot_size=1024, invert_y=False, use_datashader=False):
+def label_image_element(data, invert_y=False):
     """
-    Build the static reference (morphology) image layer.
+    Helper function to wrap a 2D label_image into an hv.Image
 
-    Unlike the previous implementation this is constructed exactly once, since the reference
+    Parameters
+    ----------
+    data: numpy.ndarray
+        2D integer array of label values.
+    invert_y: bool, optional
+        Invert plot along y axis. Default is False.
+
+    Returns
+    -------
+    holoviews.Image
+        Image element with a single 'label' value dimension.
+    """
+
+    arr = data if invert_y else np.ascontiguousarray(data[::-1])
+    h, w = arr.shape
+    return hv.Image(arr, bounds=(0, 0, w, h), vdims=['label'])
+
+
+def label_image_overlay(label_pipe, palette, plot_size=1024, invert_y=False,
+                        use_datashader=False, annotation_aggregator='max', opacity_param_object=None,
+                        annotation_toggle_param_object=None, annotation_names=None):
+    """
+    Build the dynamic, natively-coloured annotation overlay.
+
+    The overlay is driven by a Pipe stream carrying the current label_image, so pushing a new
+    label_image redraws the annotation *without* rebuilding the bokeh plot. This preserves the
+    user's zoom/pan across updates.
+
+    Parameters
+    ----------
+    label_pipe: holoviews.streams.Pipe
+        Pipe carrying the current 2D integer label_image.
+    palette: list of str
+        Hex colours, where palette[i] is the colour for annotation value i + 1. The number of
+        distinct (non-background) annotations the palette covers is taken as ``len(palette)``.
+    plot_size: int, optional
+        Figure size for plotting. Default is 1024.
+    invert_y: bool, optional
+        Invert plot along y axis. Default is False.
+    use_datashader: bool, optional
+        Use datashader regridding. Recommended for high resolution images. Default is False.
+    annotation_aggregator: str, optional
+        Datashader reduction used when several label pixels fall into one screen pixel.
+        Only used when use_datashader is True. Default is 'max'.
+
+        - 'max'  : any labelled pixel beats background, so thin strokes stay visible when
+                   zoomed out. Ties within a screen pixel resolve to the highest label value.
+        - 'mode' : majority label wins, which is area-accurate but makes sparse strokes
+                   disappear at low zoom (they lose the vote to background).
+        - 'first' / 'last' / 'min' are also accepted.
+
+        NOTE: do NOT use the datashader default of 'mean'. Averaging label 1 and label 3 gives
+        label 2, which invents classes that were never annotated.
+    opacity_param_object: panel.widgets.FloatSlider, optional
+        Slider whose value drives the overlay alpha. Default is None.
+    annotation_toggle_param_object: panel.widgets.CheckBoxGroup, optional
+        Checkbox group whose ``value`` controls which annotations are shown. Excluded annotations
+        are masked out of the rendered overlay (their pixels are treated as background/transparent)
+        without touching the underlying label_image. Must be used together with ``annotation_names``.
+        Default is None (all annotations always shown).
+    annotation_names: list of str, optional`
+        Names of the annotations in ``annotation_map`` order, so that ``annotation_names[i]`` is the name
+        of the annotation with value ``i + 1``. Required if ``annotation_toggle_param_object`` is given.
+
+    Returns
+    -------
+    holoviews.DynamicMap
+        The annotation overlay, ready to be composed into an Overlay.
+    """
+
+    n_annotations = len(palette)
+
+    valid_aggregators = ('max', 'mode', 'min', 'first', 'last')
+    if annotation_aggregator not in valid_aggregators:
+        raise ValueError(
+            f"label_aggregator must be one of {valid_aggregators!r}, got {annotation_aggregator!r}. "
+            "In particular 'mean' (the datashader default) is invalid here: averaging label "
+            "values produces classes that were never annotated, e.g. mean(1, 3) == 2."
+        )
+
+    if annotation_toggle_param_object is not None and annotation_names is not None:
+        name_to_value = {name: idx + 1 for idx, name in enumerate(annotation_names)}
+
+        def mask_hidden_labels(data, value):
+            visible_names = annotation_names if value is None else value
+            hidden_values = [name_to_value[name] for name in annotation_names if name not in visible_names]
+            if hidden_values:
+                lut = np.arange(np.iinfo(data.dtype).max + 1, dtype=data.dtype)
+                lut[hidden_values] = 0
+                data = lut[data]
+            return label_image_element(data, invert_y=invert_y)
+
+        anno = hv.DynamicMap(
+            mask_hidden_labels,
+            streams=[label_pipe, hv.streams.Params(parameters=[annotation_toggle_param_object.param.value])]
+        )
+    else:
+        anno = hv.DynamicMap(partial(label_image_element, invert_y=invert_y), streams=[label_pipe])
+
+    if use_datashader:
+        anno = hd.regrid(
+            anno,
+            aggregator=annotation_aggregator,
+            interpolation='nearest',   # never blend label values when upsampling
+            upsample=True,
+        )
+
+    anno = anno.opts(
+        cmap=palette,
+        # Bin edges land on the half-integers, so integer label value v maps to palette[v - 1].
+        clim=(0.5, n_annotations + 0.5),
+        # Discrete bins: stops the colormapper interpolating between neighbouring label colours.
+        color_levels=n_annotations,
+        # Label 0 (background) falls below the clim floor and is clipped to fully transparent.
+        clipping_colors={'min': TRANSPARENT, 'NaN': TRANSPARENT},
+        colorbar=False,
+        aspect='equal',
+        frame_height=int(plot_size),
+        frame_width=int(plot_size),
+        tools=[annotation_label_hover_tool(annotation_names)] if annotation_names is not None else ['hover'],
+        backend_opts={"plot.toolbar_location": "left"},
+    )
+
+    if opacity_param_object is not None:
+        anno = anno.apply.opts(alpha=opacity_param_object.param.value)
+
+    return anno
+
+
+def base_image_element(image, plot_size=1024, invert_y=False, use_datashader=False):
+    """
+    Helper function to build the static base (morphology) image layer.
+
+    Unlike the previous implementation this is constructed exactly once, since the base
     image never changes during annotation.
 
     Parameters
     ----------
     image: numpy.ndarray
-        RGB(A) reference image.
+        RGB(A) base image.
     plot_size: int, optional
         Figure size for plotting. Default is 1024.
     invert_y: bool, optional
@@ -628,8 +579,8 @@ def reference_image_element(image, plot_size=1024, invert_y=False, use_datashade
 
     Returns
     -------
-    holoviews.RGB or holoviews.DynamicMap
-        The reference image layer.
+    holoviews.RGB | holoviews.DynamicMap
+        The base image layer.
     """
 
     imarray_c = image.astype('uint8')
@@ -645,20 +596,10 @@ def reference_image_element(image, plot_size=1024, invert_y=False, use_datashade
 
 def clear_draw_stream(stream):
     """
-    Clear the strokes of a draw-tool stream after they have been committed to the label image.
+    Helper function to clear the strokes of a draw-tool stream after they have been committed to the label image.
 
-    Because the plot is no longer torn down and rebuilt on every update, committed strokes would
-    otherwise stay on the bokeh canvas. This clears both:
-
-    - the *live* bokeh ColumnDataSource backing the glyph (stashed on the stream as ``_draw_cds``
-      by the ``CDSCallback.initialize`` monkeypatch above), so the strokes actually disappear from
-      the canvas in the browser without the user having to select/Backspace them manually, and
-    - the stream's own python-side data, so committed strokes are not re-applied on the next
-      CDS change event.
-
-    ``_draw_cds`` is only populated once the element has actually been rendered (i.e. the plot has
-    been displayed at least once), so this falls back to resetting only the python-side stream data
-    if it is not yet available.
+    Since the bokeh plot is not being rebuilt after update and reset, the strokes remains on the bokeh canvas.
+    This fixes the issue by clearing the ColumnDataSource backing the glyph (``_draw_cds``).
 
     Parameters
     ----------
@@ -688,7 +629,7 @@ def clear_draw_stream(stream):
 # Annotation functions
 
 def annotator(tissue_tag_annotation, plot_size=1024, invert_y=False, use_datashader=False,
-              unassigned_colour="yellow", label_aggregator='max', clear_paths_on_update=True):
+              unassigned_colour="yellow", annotation_aggregator='max', clear_paths_on_update=True):
     """
     Interactive annotation tool with line annotations using Panel for switching between morphology and annotation.
 
@@ -709,8 +650,8 @@ def annotator(tissue_tag_annotation, plot_size=1024, invert_y=False, use_datasha
         If we should use datashader for rendering the image. Recommended for high resolution image. Default is False.
     unassigned_colour : str, optional
         Color for unassigned pixels. Default is "yellow".
-    label_aggregator : str, optional
-        Reduction used to downsample the label image when zoomed out. See ``label_overlay``.
+    annotation_aggregator : str, optional
+        Reduction used to downsample the label image when zoomed out. See ``label_image_overlay``.
         Default is 'max', which keeps thin strokes visible at low zoom.
     clear_paths_on_update : bool, optional
         Clear the drawn strokes once they have been committed to the label image. Default is True.
@@ -718,10 +659,7 @@ def annotator(tissue_tag_annotation, plot_size=1024, invert_y=False, use_datasha
     Returns
     -------
     Panel app
-        A panel application object with annotator tool. Includes an "Annotations:" row of
-        colour-swatched checkboxes (one per label, including "unassigned") that lets you
-        interactively hide/show the committed colour overlay for individual labels (the
-        underlying label_image and tissue image are unaffected).
+        A panel application object with annotator tool.
     """
 
     logging.getLogger('bokeh.core.validation.check').setLevel(logging.ERROR)
@@ -738,34 +676,28 @@ def annotator(tissue_tag_annotation, plot_size=1024, invert_y=False, use_datasha
         # {'default': '#00000000'} placeholder annotation_map is no longer needed.
         tissue_tag_annotation.label_image = np.zeros(
             (tissue_tag_annotation.image.shape[0], tissue_tag_annotation.image.shape[1]),
-            dtype=np.uint8
+            dtype=DEFAULT_LABEL_DTYPE
         )
 
-    n_labels = len(tissue_tag_annotation.annotation_map)
-    if n_labels > MAX_LABELS:
-        raise ValueError(
-            f"{n_labels} annotations requested but label_image is uint8, which can only hold "
-            f"{MAX_LABELS} distinct labels."
-        )
-    palette = hex_palette_from_annotation_map(tissue_tag_annotation.annotation_map)
+    palette = hex_palette_generator(tissue_tag_annotation.annotation_map)
 
     update_button = pn.widgets.Button(name='Update', button_type='primary')
     revert_button = pn.widgets.Button(name='Revert', button_type='danger', disabled=True)
-    label_opacity = pn.widgets.FloatSlider(name='Label overlay', value=0.5, start=0, end=1, step=0.1)
-    label_names = list(tissue_tag_annotation.annotation_map.keys())
-    label_visibility, label_visibility_ui = label_visibility_toggle(
+    label_image_opacity = pn.widgets.FloatSlider(name='Label overlay', value=0.5, start=0, end=1, step=0.1)
+    annotation_names = list(tissue_tag_annotation.annotation_map.keys())
+    annotation_toggle_param, annotation_toggle_widget = build_annotation_toggle_widget(
         tissue_tag_annotation.annotation_map
     )
 
     # The label image is the single source of truth; the Pipe carries it to the plot.
     label_pipe = Pipe(data=tissue_tag_annotation.label_image)
 
-    ds_img = reference_image_element(tissue_tag_annotation.image, plot_size=plot_size,
-                                     invert_y=invert_y, use_datashader=use_datashader)
-    ds_anno = label_overlay(label_pipe, n_labels, palette, plot_size=plot_size, invert_y=invert_y,
-                            use_datashader=use_datashader, label_aggregator=label_aggregator,
-                            opacity_widget=label_opacity, visibility_widget=label_visibility,
-                            label_names=label_names)
+    ds_img = base_image_element(tissue_tag_annotation.image, plot_size=plot_size,
+                                invert_y=invert_y, use_datashader=use_datashader)
+    ds_anno = label_image_overlay(label_pipe, palette, plot_size=plot_size, invert_y=invert_y,
+                                  use_datashader=use_datashader, annotation_aggregator=annotation_aggregator,
+                                  opacity_param_object=label_image_opacity, annotation_toggle_param_object=annotation_toggle_param,
+                                  annotation_names=annotation_names)
 
     plot_list = [ds_img, ds_anno]
 
@@ -781,8 +713,8 @@ def annotator(tissue_tag_annotation, plot_size=1024, invert_y=False, use_datasha
     # Built once. Never rebuilt, so the bokeh plot (and the user's zoom/pan) survives updates.
     tab_object = pn.panel(hv.Overlay(plot_list).collate())
     p = pn.Column(
-        pn.Row(label_opacity, update_button, revert_button),
-        label_visibility_ui,
+        pn.Row(label_image_opacity, update_button, revert_button),
+        annotation_toggle_widget,
         tab_object,
     )
 
@@ -1080,7 +1012,7 @@ def segmenter(tissue_tag_annotation, plot_size=1024, invert_y=False, use_datasha
     annotation_prefix : str, optional
         Prefix for annotations. Default is "object".
     label_aggregator : str, optional
-        Reduction used to downsample the label image when zoomed out. See ``label_overlay``.
+        Reduction used to downsample the label image when zoomed out. See ``label_image_overlay``.
         Default is 'max'.
 
     Returns
@@ -1092,28 +1024,29 @@ def segmenter(tissue_tag_annotation, plot_size=1024, invert_y=False, use_datasha
     if tissue_tag_annotation.label_image is None:
         tissue_tag_annotation.label_image = np.zeros(
             (tissue_tag_annotation.image.shape[0], tissue_tag_annotation.image.shape[1]),
-            dtype=np.uint8
+            dtype=DEFAULT_LABEL_DTYPE
         )
         tissue_tag_annotation.annotation_map = OrderedDict({})
 
     if tissue_tag_annotation.annotation_map is None:
         tissue_tag_annotation.annotation_map = OrderedDict({})
 
-    # Fixed palette covering the whole uint8 label space. palette[i] is the colour for label i + 1.
-    palette = [SEGMENTER_COLORPOOL[i % len(SEGMENTER_COLORPOOL)] for i in range(MAX_LABELS)]
-    palette = hex_palette_from_annotation_map(OrderedDict(enumerate(palette)))
+    max_labels = np.iinfo(tissue_tag_annotation.label_image.dtype).max
+
+    palette_colors = (SEGMENTER_COLORPOOL[i % len(SEGMENTER_COLORPOOL)] for i in range(max_labels))
+    palette = hex_palette_generator(OrderedDict(enumerate(palette_colors)))
 
     update_button = pn.widgets.Button(name='Update', button_type='primary')
     revert_button = pn.widgets.Button(name='Revert', button_type='danger', disabled=True)
-    label_opacity = pn.widgets.FloatSlider(name='Label overlay', value=0.5, start=0, end=1, step=0.1)
+    label_image_opacity = pn.widgets.FloatSlider(name='Label overlay', value=0.5, start=0, end=1, step=0.1)
 
     label_pipe = Pipe(data=tissue_tag_annotation.label_image)
 
-    ds_img = reference_image_element(tissue_tag_annotation.image, plot_size=plot_size,
-                                     invert_y=invert_y, use_datashader=use_datashader)
-    ds_anno = label_overlay(label_pipe, MAX_LABELS, palette, plot_size=plot_size, invert_y=invert_y,
-                            use_datashader=use_datashader, label_aggregator=label_aggregator,
-                            opacity_widget=label_opacity)
+    ds_img = base_image_element(tissue_tag_annotation.image, plot_size=plot_size,
+                                invert_y=invert_y, use_datashader=use_datashader)
+    ds_anno = label_image_overlay(label_pipe, palette, plot_size=plot_size, invert_y=invert_y,
+                                  use_datashader=use_datashader, annotation_aggregator=label_aggregator,
+                                  opacity_param_object=label_image_opacity)
 
     plot_list = [ds_img, ds_anno]
 
@@ -1129,7 +1062,7 @@ def segmenter(tissue_tag_annotation, plot_size=1024, invert_y=False, use_datasha
     plot_list.append(erase_path_object)
 
     tab_object = pn.panel(hv.Overlay(plot_list).collate())
-    p = pn.Column(pn.Row(label_opacity, update_button, revert_button), tab_object)
+    p = pn.Column(pn.Row(label_image_opacity, update_button, revert_button), tab_object)
 
     previous_label = tissue_tag_annotation.label_image.copy()
     previous_annotation_map = tissue_tag_annotation.annotation_map.copy()
@@ -1161,9 +1094,9 @@ def segmenter(tissue_tag_annotation, plot_size=1024, invert_y=False, use_datasha
         if draw_object.data['xs']:
             for o in range(len(draw_object.data['xs'])):
                 label_value = existing_object_count + o
-                if label_value > MAX_LABELS:
+                if label_value > max_labels:
                     warnings.warn(
-                        f"Reached the {MAX_LABELS}-object limit of a uint8 label_image; "
+                        f"Reached the {max_labels}-object limit for label_image; "
                         "further objects were ignored."
                     )
                     break
