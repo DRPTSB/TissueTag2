@@ -280,6 +280,12 @@ class WritableLabelStore:
     def dtype(self):
         return self._array.dtype
 
+    @property
+    def chunk_shape(self):
+        """On-disk chunk shape (y, x), e.g. for grouping many small writes so each on-disk
+        chunk is touched once instead of once per write (see write_disks_batched)."""
+        return self._array.chunks[:2]
+
     def read_block(self, y0, y1, x0, x1):
         """Read and return (as a small in-memory numpy array) just the
         ``[y0:y1, x0:x1]`` region."""
@@ -289,6 +295,44 @@ class WritableLabelStore:
         """Write ``block`` into the ``[y0:y1, x0:x1]`` region in place, on
         disk."""
         self._array[y0:y1, x0:x1] = block
+
+    def write_masked(self, y0, y1, x0, x1, local_mask, value, preserve_existing=False):
+        """
+        Write ``value`` into the pixels selected by ``local_mask`` (boolean array shaped like
+        the ``[y0:y1, x0:x1]`` block) within that bounding box, leaving the rest of the block
+        untouched. This is the shared primitive behind both the interactive annotator/segmenter's
+        stroke commits and the sparse disk-shaped writes used for gene/background label
+        assignment -- in both cases the caller only knows the shape of *one* touched region, not
+        the whole array.
+
+        Parameters
+        ----------
+        y0, y1, x0, x1 : int
+            Bounding box of the block to read/write.
+        local_mask : numpy.ndarray of bool
+            Shape ``(y1 - y0, x1 - x0)``. Pixels where this is True are candidates for being set
+            to ``value``.
+        value : int
+            Label value to write.
+        preserve_existing : bool, optional
+            If True, pixels that are already non-zero are left alone -- only pixels that are
+            both selected by ``local_mask`` and currently 0 get written. Used when a "background"
+            or other lower-priority label must never clobber an existing annotation. Default False
+            (unconditional overwrite within ``local_mask``, e.g. for a higher-priority label that
+            should always win).
+
+        Returns
+        -------
+        numpy.ndarray
+            The block's pre-write contents, for undo.
+        """
+
+        prev_block = self.read_block(y0, y1, x0, x1)
+        write_mask = local_mask & (prev_block == 0) if preserve_existing else local_mask
+        new_block = prev_block.copy()
+        new_block[write_mask] = value
+        self.write_block(y0, y1, x0, x1, new_block)
+        return prev_block
 
     def to_dataarray(self, chunks='auto'):
         """Fresh lazy dask/xarray view of the store's current contents, for

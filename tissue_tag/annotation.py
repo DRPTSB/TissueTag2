@@ -733,12 +733,10 @@ def _write_polygon_strokes_file_backed(writer, strokes):
         y0, y1 = int(rr_in.min()), int(rr_in.max()) + 1
         x0, x1 = int(cc_in.min()), int(cc_in.max()) + 1
 
-        prev_block = writer.read_block(y0, y1, x0, x1)
+        local_mask = np.zeros((y1 - y0, x1 - x0), dtype=bool)
+        local_mask[rr_in - y0, cc_in - x0] = True
+        prev_block = writer.write_masked(y0, y1, x0, x1, local_mask, label_value, preserve_existing=False)
         written.append((y0, y1, x0, x1, prev_block))
-
-        new_block = prev_block.copy()
-        new_block[rr_in - y0, cc_in - x0] = label_value
-        writer.write_block(y0, y1, x0, x1, new_block)
 
     return written
 
@@ -1412,6 +1410,122 @@ def segmenter(tissue_tag_annotation, plot_size=1024, invert_y=False, use_datasha
     return p
 
 
+def _write_disks_batched_file_backed(writer, points, r, value, preserve_existing=False):
+    """
+    Write same-radius, same-value disks centred at each ``(cy, cx)`` in ``points`` directly onto
+    ``writer``'s on-disk label store, in place of ``skimage.draw.disk(...)`` + a full-array
+    assignment. Used by ``gene_labels_from_adata``'s file-backed path for both the sparse
+    background grid and gene-marked cell positions.
+
+    Writes are batched by on-disk chunk (``writer.chunk_shape``) rather than done one bounding
+    box per point: for a large sparse grid (thousands-tens of thousands of points, as
+    ``space_every_spots`` produces on a big image), one read+write round trip per point does not
+    scale -- at that call volume it was observed to make zarr's sync/async bridge spin up an
+    unbounded number of OS threads rather than merely being slow. Grouping points by which
+    on-disk chunk they fall in (padding each group's read/write region by ``r`` to catch a disk
+    spilling slightly past its chunk's edge) bounds the number of round trips by the number of
+    *chunks* actually touched, independent of how many points land in each one.
+
+    Parameters
+    ----------
+    writer: file_backed.WritableLabelStore
+    points: iterable of (cy, cx)
+        Disk centres, in array (row, column) coordinates.
+    r: float
+        Disk radius.
+    value: int
+        Label value to write.
+    preserve_existing: bool, optional
+        See ``file_backed.WritableLabelStore.write_masked``. Default False.
+    """
+
+    points = list(points)
+    if not points:
+        return
+
+    chunk_h, chunk_w = writer.chunk_shape
+    shape = writer.shape
+    pad = int(np.ceil(r))
+
+    buckets = {}
+    for cy, cx in points:
+        key = (int(cy) // chunk_h, int(cx) // chunk_w)
+        buckets.setdefault(key, []).append((cy, cx))
+
+    for (cy_idx, cx_idx), pts in buckets.items():
+        base_y0, base_x0 = cy_idx * chunk_h, cx_idx * chunk_w
+        y0 = max(0, base_y0 - pad)
+        y1 = min(shape[0], base_y0 + chunk_h + pad)
+        x0 = max(0, base_x0 - pad)
+        x1 = min(shape[1], base_x0 + chunk_w + pad)
+        if y0 >= y1 or x0 >= x1:
+            continue
+
+        local_mask = np.zeros((y1 - y0, x1 - x0), dtype=bool)
+        for cy, cx in pts:
+            rr, cc = disk((cy - y0, cx - x0), r, shape=(y1 - y0, x1 - x0))
+            local_mask[rr, cc] = True
+
+        writer.write_masked(y0, y1, x0, x1, local_mask, value, preserve_existing=preserve_existing)
+
+
+def _background_labels_intensity_file_backed(writer, image, r, intensity_threshold, grid_unit_size,
+                                              label, preserve_existing):
+    """
+    File-backed counterpart of ``background_labels_intensity``: paints a disk of ``label`` at
+    every sparse grid point whose pixel is bright enough to count as background, writing straight
+    to ``writer``'s on-disk label store instead of building a full-resolution numpy array.
+
+    The grid itself (``square_grid``) is already sparse (spaced ``grid_unit_size`` spot-diameters
+    apart) and cheap regardless of image size, but a large image can still produce tens of
+    thousands of grid points. Testing each point's brightness is batched into a single
+    ``dask.array.vindex`` gather (paired/vectorized indexing, like
+    ``organaxis.get_annotations_for_objects``), so only the on-disk chunks actually containing a
+    grid point are ever touched; the resulting disk writes are batched by chunk too (see
+    ``_write_disks_batched_file_backed``) rather than done one at a time.
+
+    Parameters
+    ----------
+    writer: file_backed.WritableLabelStore
+    image: xarray.DataArray
+        Dask-backed RGB(A) image (``tissue_tag_annotation.image``).
+    r: float
+        Disk radius for each background spot.
+    intensity_threshold: int
+    grid_unit_size: int
+    label: int
+        Label value for background spots.
+    preserve_existing: bool
+        See ``file_backed.WritableLabelStore.write_masked``.
+    """
+
+    shape = writer.shape
+    grid = square_grid(r, shape, grid_unit_size).T
+    if grid.size == 0:
+        return
+
+    ys = grid[:, 1].astype(int)
+    xs = grid[:, 0].astype(int)
+    valid = (ys >= 0) & (xs >= 0) & (ys < shape[0]) & (xs < shape[1])
+    ys, xs = ys[valid], xs[valid]
+    if ys.size == 0:
+        return
+
+    n_bands = image.sizes['band']
+    points = image.data.vindex[ys, xs, :].compute().astype(np.float64)
+
+    if n_bands == 4:
+        grayscale_vals = points[:, :3] @ [0.2989, 0.5870, 0.1140]
+    elif n_bands == 3:
+        grayscale_vals = points @ [0.2989, 0.5870, 0.1140]
+    else:
+        raise ValueError("Unexpected number of channels in imarray.")
+
+    is_background = grayscale_vals > intensity_threshold
+    background_points = list(zip(ys[is_background].tolist(), xs[is_background].tolist()))
+    _write_disks_batched_file_backed(writer, background_points, r, label, preserve_existing=preserve_existing)
+
+
 def gene_labels_from_adata(adata, gene_markers, tissue_tag_annotation, diameter, override_labels=False,
                            space_every_spots=10, normalize=True, unassigned_colour="yellow", intensity_threshold=230,
                            copy=False):
@@ -1449,9 +1563,24 @@ def gene_labels_from_adata(adata, gene_markers, tissue_tag_annotation, diameter,
     """
 
     tissue_tag_annotation = cp.deepcopy(tissue_tag_annotation) if copy else tissue_tag_annotation
-    tissue_tag_annotation = _ensure_in_memory(tissue_tag_annotation)
+    use_file_backed = tissue_tag_annotation.file_backed
 
-    if tissue_tag_annotation.label_image is not None:
+    if use_file_backed:
+        # A file-backed label_image is never None (to_file_backed() always leaves a store in
+        # place, all-zero if none existed), so recreating it here (override_labels) or leaving
+        # it as the writable target (add-on-top) covers what the in-memory branch below does.
+        from tissue_tag import file_backed as fb
+        fb.configure_dask_for_low_ram()
+        if override_labels:
+            print("Label image is not empty. Will replace with an empty label_image.")
+            fb.zeros_zarr(
+                (int(tissue_tag_annotation.image.sizes['y']), int(tissue_tag_annotation.image.sizes['x'])),
+                tissue_tag_annotation.label_store, overwrite=True,
+            )
+            tissue_tag_annotation.refresh_label_view()
+        else:
+            print("Will add new gene labels on top of old label_image.")
+    elif tissue_tag_annotation.label_image is not None:
         print("Label image is not empty.")
         if override_labels:
             # Initialize label image
@@ -1476,12 +1605,25 @@ def gene_labels_from_adata(adata, gene_markers, tissue_tag_annotation, diameter,
     r = diameter / 2 * tissue_tag_annotation.ppm
 
     # Extract coordinates
-    labels = background_labels_intensity(tissue_tag_annotation.label_image.shape[:2],
-                                         imarray=tissue_tag_annotation.image, r=r,
-                                         intensity_threshold=intensity_threshold, grid_unit_size=space_every_spots,
-                                         label=1)
-    mask = tissue_tag_annotation.label_image > 0
-    labels[mask] = tissue_tag_annotation.label_image[mask]  # add old labels if these are not empty
+    if use_file_backed:
+        # Writes go straight to the on-disk label store, batched by on-disk chunk -- see
+        # _background_labels_intensity_file_backed and _write_disks_batched_file_backed.
+        # Background spots use preserve_existing=True so they never clobber pixels the user (or
+        # an earlier call) already annotated, matching the in-memory branch's
+        # `labels[mask] = tissue_tag_annotation.label_image[mask]` merge below.
+        writer = tissue_tag_annotation.label_writer()
+        _background_labels_intensity_file_backed(
+            writer, tissue_tag_annotation.image, r=r,
+            intensity_threshold=intensity_threshold, grid_unit_size=space_every_spots,
+            label=1, preserve_existing=True,
+        )
+    else:
+        labels = background_labels_intensity(tissue_tag_annotation.label_image.shape[:2],
+                                             imarray=tissue_tag_annotation.image, r=r,
+                                             intensity_threshold=intensity_threshold, grid_unit_size=space_every_spots,
+                                             label=1)
+        mask = tissue_tag_annotation.label_image > 0
+        labels[mask] = tissue_tag_annotation.label_image[mask]  # add old labels if these are not empty
 
     if normalize:
         normalize_total(adata)
@@ -1513,11 +1655,15 @@ def gene_labels_from_adata(adata, gene_markers, tissue_tag_annotation, diameter,
                 "expression": GeneData[nonzero_indices]
             })
 
-            # Shuffle within expression levels to avoid spatial artifacts
-            gene_df = gene_df.groupby("expression", group_keys=False).apply(lambda x: x.sample(frac=1))
+            # Shuffle within expression levels to avoid spatial artifacts: shuffle all rows once,
+            # then stable-sort descending by expression so ties keep their shuffled relative
+            # order. (Equivalent to, but avoids, groupby("expression").apply(sample) -- pandas
+            # >=2.2 drops the grouping column from that apply's result, which would otherwise
+            # break the sort_values("expression") below with a KeyError.)
+            gene_df = gene_df.sample(frac=1)
 
             # Now sort by expression descending
-            gene_df_sorted = gene_df.sort_values("expression", ascending=False)
+            gene_df_sorted = gene_df.sort_values("expression", ascending=False, kind="stable")
 
             # Take top N
             actual_top_n = min(top_n, len(gene_df_sorted))
@@ -1533,10 +1679,22 @@ def gene_labels_from_adata(adata, gene_markers, tissue_tag_annotation, diameter,
             if sub == label:
                 label_value = idx
 
-        for coor in tissue_tag_annotation.positions.loc[list(combined_gene_indices), ["pxl_row", "pxl_col"]].to_numpy():
-            labels[disk((coor[0], coor[1]), r)] = label_value + 1
+        # Gene-marked cells always override whatever is there (background or existing
+        # annotation), applied last -- matches the in-memory branch's unconditional
+        # `labels[disk(...)] = label_value + 1`.
+        coords = tissue_tag_annotation.positions.loc[list(combined_gene_indices), ["pxl_row", "pxl_col"]].to_numpy()
+        if use_file_backed:
+            _write_disks_batched_file_backed(
+                writer, [(coor[0], coor[1]) for coor in coords], r, label_value + 1, preserve_existing=False,
+            )
+        else:
+            for coor in coords:
+                labels[disk((coor[0], coor[1]), r)] = label_value + 1
 
-    tissue_tag_annotation.label_image = labels
+    if use_file_backed:
+        tissue_tag_annotation.refresh_label_view()
+    else:
+        tissue_tag_annotation.label_image = labels
 
     return tissue_tag_annotation if copy else None
 
@@ -1697,10 +1855,9 @@ def assign_annotation_label_to_positions(tissue_tag_annotation, annotation_colum
         raise ValueError("Positions data frame is missing. Please provide positions data frame.")
 
     tissue_tag_annotation = cp.deepcopy(tissue_tag_annotation) if copy else tissue_tag_annotation
-    # get_annotations_for_objects() below indexes label_image with paired integer arrays
-    # (numpy "fancy" indexing); an xarray-backed label_image would instead perform outer-product
-    # indexing there, silently giving wrong results, so this must be plain numpy.
-    tissue_tag_annotation = _ensure_in_memory(tissue_tag_annotation)
+    # get_annotations_for_objects() does its own paired (non-outer-product) point indexing for
+    # a file-backed label_image, touching only the chunks containing the requested points -- see
+    # its docstring/comments in organaxis.py. No materialisation needed here.
 
     coord_df = tissue_tag_annotation.positions[["pxl_row", "pxl_col"]].rename(columns={"pxl_row":"x", "pxl_col":"y"})
     tissue_tag_annotation.positions[annotation_column] = get_annotations_for_objects(tissue_tag_annotation, coord_df)

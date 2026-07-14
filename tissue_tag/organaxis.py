@@ -161,7 +161,20 @@ def get_annotations_for_objects(tissue_tag_annotation, coord_df):
         raise ValueError("Please provide a DataFrame containing two columns with x,y coordinates only.")
 
     annotation_label_mapping = {i + 1: v for i, v in enumerate(tissue_tag_annotation.annotation_map.keys())}
-    annotation_ids = tissue_tag_annotation.label_image[np.rint(coord_df["x"]).astype(int), np.rint(coord_df["y"]).astype(int)]
+    rows = np.rint(coord_df["x"]).astype(int).to_numpy()
+    cols = np.rint(coord_df["y"]).astype(int).to_numpy()
+
+    label_image = tissue_tag_annotation.label_image
+    if hasattr(label_image, 'dims'):
+        # File-backed (dask-backed xarray.DataArray): plain `arr[rows, cols]` would perform
+        # outer-product indexing instead of numpy's paired/vectorized indexing, and would also
+        # materialise the whole array to do it. dask's `.vindex` does genuine paired indexing,
+        # lazily, touching only the chunks that contain the requested points -- so this stays
+        # low-RAM regardless of image size, bounded only by len(coord_df).
+        annotation_ids = label_image.data.vindex[rows, cols].compute()
+    else:
+        annotation_ids = label_image[rows, cols]
+
     vectorized_map = np.vectorize(lambda x: annotation_label_mapping.get(x, "Unknown"), otypes=[object])
 
     return vectorized_map(annotation_ids)

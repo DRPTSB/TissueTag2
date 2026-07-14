@@ -270,6 +270,44 @@ def run(work_dir, side, threshold_mb):
     finally:
         shutil.rmtree(crop_work_dir, ignore_errors=True)
 
+    # --- Step 6: gene_labels_from_adata / assign_annotation_label_to_positions -- these *are*
+    # chunk-aware (unlike Step 5's classifier): background/gene-marker disk writes go straight to
+    # the on-disk label store batched by chunk, and position lookups use dask's vindex, so this
+    # stays inside the same RSS budget as steps 1-4 rather than materialising anything full-size. ---
+    print("\nStep 6 -- gene_labels_from_adata / assign_annotation_label_to_positions (chunk-aware)")
+    import anndata
+    import scipy.sparse as sp
+    import pandas as pd
+    from tissue_tag.annotation import gene_labels_from_adata, assign_annotation_label_to_positions
+
+    rng = np.random.default_rng(0)
+    n_cells = 300
+    positions = pd.DataFrame({
+        "pxl_row": rng.uniform(500, side - 500, n_cells),
+        "pxl_col": rng.uniform(500, side - 500, n_cells),
+    }, index=[f"cell_{i}" for i in range(n_cells)])
+    genes = ["MarkerA", "MarkerB"]
+    X = np.zeros((n_cells, len(genes)))
+    X[:100, 0] = np.arange(1, 101)
+    X[100:200, 1] = np.arange(1, 101)
+    adata = anndata.AnnData(X=sp.csr_matrix(X), obs=pd.DataFrame(index=positions.index),
+                            var=pd.DataFrame(index=genes))
+    gene_markers = {"cortex": [("MarkerA", 50)], "medulla": [("MarkerB", 50)]}
+
+    tta.positions = positions
+    gene_monitor = PeakRSSMonitor()
+    with gene_monitor:
+        t0 = time.time()
+        gene_labels_from_adata(adata, gene_markers, tta, diameter=20, space_every_spots=10, normalize=False)
+        gene_elapsed = time.time() - t0
+        assign_annotation_label_to_positions(tta)
+    print(f"Step 6 took {gene_elapsed:.1f}s (label assignment) + lookup; "
+          f"peak RSS during step 6: {gene_monitor.peak_mb:.0f} MB")
+    check(tta.file_backed, "tissue annotation stays file-backed after gene_labels_from_adata")
+    check(set(tta.positions["annotation"].unique()) <= {"cortex", "medulla", "unassigned", "Unknown"},
+          "assign_annotation_label_to_positions produced only expected labels")
+    check(gene_monitor.peak_mb < threshold_mb, f"peak RSS during step 6 stayed under {threshold_mb} MB")
+
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
