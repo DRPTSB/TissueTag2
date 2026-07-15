@@ -26,6 +26,7 @@ xarray, dask[array], zarr>=3, dask-ml.
 """
 
 import os
+import warnings
 
 import numpy as np
 
@@ -340,7 +341,17 @@ class WritableLabelStore:
         return label_dataarray(self._array, chunks=chunks)
 
     def materialize(self):
-        """Read the entire store into memory as a plain numpy array. Used
-        only by the numpy-only consumers (classifier, median filter, ...)
-        that have not been made chunk-aware; see ``annotation._ensure_in_memory``."""
+        """
+        Read the entire store into memory as a plain numpy array. Warns, since this defeats the
+        purpose of a file-backed label store; prefer ``read_block()``/``write_block()`` for
+        bounded-memory access, or ``to_dataarray()`` for a lazy view. Numpy-only consumers that
+        aren't chunk-aware (the pixel classifier, median filter, ...) use
+        ``annotation._ensure_in_memory`` instead, which materialises via the lazy dask/xarray
+        view rather than this method, but emits an equivalent warning.
+        """
+        warnings.warn(
+            "WritableLabelStore.materialize() loads the full label store into RAM; prefer "
+            "read_block()/write_block() for bounded-memory access, or to_dataarray() for a "
+            "lazy view, where possible."
+        )
         return np.asarray(self._array[:])

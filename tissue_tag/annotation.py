@@ -940,6 +940,27 @@ def annotator(tissue_tag_annotation, plot_size=1024, invert_y=False, use_datasha
     return p
 
 
+def _warn_materializing(what):
+    """
+    Emit a consistent warning wherever file-backed data is about to be pulled fully into RAM
+    because the operation performing it is not chunk-aware. Shared by ``_ensure_in_memory``
+    (which materialises in place) and read-only call sites that materialise a local copy without
+    mutating the caller's ``TissueTagAnnotation`` (``rgb_from_labels``, ``plot_labels``,
+    ``file_backed.WritableLabelStore.materialize``).
+
+    Parameters
+    ----------
+    what: str
+        Name of the operation doing the materialising, included in the warning message.
+    """
+
+    warnings.warn(
+        f"{what} is not chunk-aware and will load the full array into RAM (equivalent to the "
+        "in-memory pipeline's peak usage for this step); see tissue_tag.file_backed and the "
+        "file_backed docs on annotator/segmenter for the parts of the pipeline that stay low-RAM."
+    )
+
+
 def _ensure_in_memory(tissue_tag_annotation):
     """
     Materialize a file-backed ``TissueTagAnnotation``'s ``image``/``label_image`` into plain
@@ -968,12 +989,7 @@ def _ensure_in_memory(tissue_tag_annotation):
     if not tissue_tag_annotation.file_backed:
         return tissue_tag_annotation
 
-    warnings.warn(
-        "This operation is not chunk-aware and will load the full image/label_image into RAM "
-        "(equivalent to the in-memory pipeline's peak usage for this step); see "
-        "tissue_tag.file_backed and the file_backed docs on annotator/segmenter for the parts "
-        "of the pipeline that stay low-RAM."
-    )
+    _warn_materializing("This operation")
     tissue_tag_annotation.image = np.asarray(tissue_tag_annotation.image)
     if tissue_tag_annotation.label_image is not None:
         tissue_tag_annotation.label_image = np.asarray(tissue_tag_annotation.label_image)
@@ -994,7 +1010,7 @@ def rgb_from_labels(tissue_tag_annotation):
     for this function by 8x (a 20k x 20k label image previously allocated ~12.8 GB here).
 
     NOTE: not chunk-aware -- if ``tissue_tag_annotation`` is file-backed, this materialises the
-    full label_image into RAM (see ``_ensure_in_memory``).
+    full label_image into RAM and warns (see ``_warn_materializing``).
 
     Parameters
     ----------
@@ -1010,6 +1026,8 @@ def rgb_from_labels(tissue_tag_annotation):
     # Read-only: materialise a local numpy view without mutating the caller's (possibly
     # file-backed) object, unlike the classifier/median_filter/... helpers below which already
     # have copy=False/True semantics that make an in-place materialisation expected.
+    if _is_xarray_backed(tissue_tag_annotation.label_image):
+        _warn_materializing("rgb_from_labels")
     label_image = np.asarray(tissue_tag_annotation.label_image)
 
     labelimage_rgb = np.zeros(
@@ -1204,6 +1222,8 @@ def plot_labels(tissue_tag_annotation, alpha=0.8):
     annotation = rgb_from_labels(tissue_tag_annotation)
     # Read-only preview plot: materialise a local numpy view (see rgb_from_labels) without
     # mutating a file-backed tissue_tag_annotation.
+    if _is_xarray_backed(tissue_tag_annotation.image):
+        _warn_materializing("plot_labels")
     return overlay_labels(np.asarray(tissue_tag_annotation.image), annotation, alpha, show=True)
 
 
@@ -1893,6 +1913,8 @@ def plot_cell_label_annotations(tissue_tag_annotation, cell_diameter=5.0, annota
 
     fig, ax = plt.subplots(figsize=(10, 10), dpi = 100)
 
+    if _is_xarray_backed(tissue_tag_annotation.image):
+        _warn_materializing("plot_cell_label_annotations")
     base_img = np.zeros(tissue_tag_annotation.image.shape, dtype=tissue_tag_annotation.image.dtype)
     base_img[:, :, :] = (alpha * tissue_tag_annotation.image[:, :, :])
     base_img[:, :, 3] = 255
