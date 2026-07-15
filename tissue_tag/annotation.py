@@ -65,7 +65,7 @@ SEGMENTER_COLORPOOL = ['green', 'cyan', 'brown', 'magenta', 'blue', 'red', 'oran
 
 # Per-task memory budget (bytes), used to patch datashader's Canvas.raster() (see below) so
 # that regridding a file-backed (dask/Zarr-backed) image or label overlay stays low-RAM.
-REGRID_MAX_MEM_BYTES = 64 * 1024 * 1024  # 64MB
+REGRID_MAX_MEM_BYTES = 256 * 1024 * 1024  # 256MB
 
 _original_canvas_raster = ds.Canvas.raster
 
