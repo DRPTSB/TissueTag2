@@ -1,6 +1,8 @@
 # File-Backed Low-RAM Mode: Implementation Summary
 
-Branch: `file_backed_mode` (2 commits on top of `main`: `0861d5e`, `76a9956`)
+Branch: `file_backed_mode` (3 code commits on top of `main`: `0861d5e`,
+`76a9956`, `b8d2876`; a separate `8775100` adds this file, the original
+plan, and a full chat export).
 
 This document summarizes the implementation of an opt-in, file-backed (Zarr +
 Dask + Xarray) low-RAM mode for TissueTag2, following `file_backed_plan.md`.
@@ -67,7 +69,7 @@ Core Zarr/Dask/Xarray primitives:
 `TissueTagAnnotation` (dataclass) gains:
 - `image_store` / `label_store: Optional[str]` fields and a `file_backed`
   property.
-- `to_file_backed(work_dir, chunks=None, overwrite=True)`: one-time
+- `to_file_backed(file_backed_dir, chunks=None, overwrite=True)`: one-time
   conversion of `image`/`label_image` to on-disk Zarr stores + lazy views;
   safe to call on an already-partially-file-backed object.
 - `label_writer()`: returns a `WritableLabelStore` bound to the object's
@@ -80,6 +82,38 @@ Zarr store *paths* into the HDF5 file instead of re-serialising the arrays
 (verified: 8,248 bytes instead of hundreds of MB). `load_annotation` reopens
 them as lazy views.
 
+**Loaders (`read_image`, `read_visium`, `read_visium_hd`, `read_xenium`)**
+all gained `file_backed=False, file_backed_dir=None` parameters, so a large
+image can be loaded straight into file-backed mode in one call instead of
+loading in-memory and calling `to_file_backed()` as a separate step:
+
+```python
+tta = tt.read_image(path, ppm_image=1, file_backed=True)
+```
+
+Each loader still decodes/resizes/blends the image fully in memory first —
+PIL/tifffile have no chunked reader for PNG/JPEG, and contrast enhancement,
+vH&E blending, and Xenium channel stacking all need the whole array anyway
+— but when `file_backed=True` a new shared helper, `io._finalize_annotation`,
+persists the result to an on-disk Zarr store and the in-memory array is
+dropped immediately afterward, before the caller ever holds it alongside a
+second full-resolution copy later on (annotator/segmenter, classifier).
+`file_backed_dir` is optional; if not given, `_finalize_annotation` creates
+a fresh temporary directory (`tempfile.mkdtemp(prefix="tissue_tag_")`).
+
+The directory-for-on-disk-stores parameter is named `file_backed_dir`
+consistently across the whole public API (`TissueTagAnnotation.to_file_backed`,
+`annotator()`, `segmenter()`, and all four loaders) — it was originally
+called `work_dir` and was renamed for API consistency partway through
+implementation.
+
+Verified against real sample data for `read_image` and `read_visium`
+(file-backed output pixel-identical to in-memory, both with an
+auto-generated temp directory and an explicit `file_backed_dir`).
+`read_visium_hd` and `read_xenium` got the identical code pattern but
+weren't separately exercised against real data -- no local sample dataset
+for either was available in this environment.
+
 ### `tissue_tag/annotation.py` (largest set of changes)
 
 - **`base_image_element` / `label_image_overlay` / `label_image_element`**
@@ -88,7 +122,7 @@ them as lazy views.
   `regrid`. The label-masking step (`mask_hidden_labels`, used to toggle
   annotation visibility) applies its LUT via `dask.array.map_blocks` instead
   of plain numpy fancy indexing, so it stays chunk-aware too.
-- **`annotator()` / `segmenter()`** gained `file_backed`/`work_dir`
+- **`annotator()` / `segmenter()`** gained `file_backed`/`file_backed_dir`
   parameters. When enabled, drawn-stroke commits go through
   `_write_polygon_strokes_file_backed` / `_revert_polygon_strokes_file_backed`,
   which compute each stroke's bounding box and read/write only that region
@@ -221,23 +255,37 @@ to before this branch existed.
 
 ## Usage
 
+Simplest: load straight into file-backed mode.
+
 ```python
 import tissue_tag as tt
 from tissue_tag.annotation import annotator
 
-tta = tt.read_image("huge_image.tif", ppm_image=1, plot=False)
+# file_backed_dir is optional -- omit it to use a fresh temporary directory
+tta = tt.read_image("huge_image.tif", ppm_image=1, plot=False,
+                    file_backed=True, file_backed_dir="/scratch/my_annotation")
 tta.annotation_map = {"cortex": "green", "medulla": "blue"}
 
-# Opt in: converts image/label_image to on-disk Zarr stores under work_dir
-app = annotator(tta, use_datashader=True, file_backed=True, work_dir="/scratch/my_annotation")
-```
-
-Or convert explicitly ahead of time:
-
-```python
-tta.to_file_backed("/scratch/my_annotation")
 app = annotator(tta, use_datashader=True)  # file_backed inferred from tta.file_backed
 ```
+
+Or load in-memory as usual and opt in later, either explicitly:
+
+```python
+tta = tt.read_image("huge_image.tif", ppm_image=1, plot=False)
+tta.to_file_backed("/scratch/my_annotation")
+app = annotator(tta, use_datashader=True)
+```
+
+...or by letting `annotator()`/`segmenter()` do the conversion on first use:
+
+```python
+tta = tt.read_image("huge_image.tif", ppm_image=1, plot=False)
+app = annotator(tta, use_datashader=True, file_backed=True, file_backed_dir="/scratch/my_annotation")
+```
+
+`read_visium`, `read_visium_hd`, and `read_xenium` accept the same
+`file_backed`/`file_backed_dir` pair.
 
 Install the extra: `pip install -e .[file_backed]`.
 
