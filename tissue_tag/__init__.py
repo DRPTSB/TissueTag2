@@ -17,6 +17,16 @@ for _env_var in ("NUMBA_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS",
     os.environ.setdefault(_env_var, str(min(4, os.cpu_count() or 1)))
 del _env_var
 
+# On macOS in particular, numba's default threading layer (TBB or OpenMP, depending on what's
+# installed) can conflict with Apple's own Accelerate/vecLib BLAS backend -- which numpy
+# typically uses on Apple Silicon -- when both try to manage native threads in the same process.
+# This is a separate, well-documented crash class from the thread-*count* issue above (it doesn't
+# show up as runaway thread counts; it can hang or crash outright, silently, regardless of how few
+# threads are requested). numba's own docs recommend 'workqueue' -- its simplest threading layer,
+# with no external OpenMP/TBB dependency -- as the standard fix. setdefault() so this never
+# overrides an explicit choice.
+os.environ.setdefault("NUMBA_THREADING_LAYER", "workqueue")
+
 from .organaxis import *
 from .io import *
 from . import annotation

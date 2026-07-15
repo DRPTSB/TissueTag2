@@ -474,6 +474,44 @@ def _is_xarray_backed(data):
     return hasattr(data, 'dims') and hasattr(data, 'coords')
 
 
+def _resolve_use_datashader(use_datashader, use_file_backed):
+    """
+    Couple `use_datashader`'s default to file-backed status: when unset (None), it's True
+    whenever file-backed mode is active and False otherwise, matching the only combination
+    that actually keeps rendering low-RAM. An explicit choice is always honoured, but choosing
+    file-backed + no datashader warns loudly rather than failing silently/confusingly later --
+    without datashader's viewport-based downsampling, rendering ships the *entire* image to the
+    browser as one payload, which can outright fail on a large image (e.g. a browser-side
+    "allocation size overflow" trying to allocate a buffer for the whole array) instead of the
+    bounded, viewport-sized payload datashader would send.
+
+    Parameters
+    ----------
+    use_datashader: bool or None
+        The caller's `use_datashader` argument.
+    use_file_backed: bool
+        Whether file-backed mode is active for this call.
+
+    Returns
+    -------
+    bool
+        The resolved `use_datashader` value.
+    """
+
+    if use_datashader is None:
+        return use_file_backed
+    if use_file_backed and not use_datashader:
+        warnings.warn(
+            "file-backed mode with use_datashader=False will materialise the *entire* image to "
+            "render it (no viewport-based downsampling) and ship it to the browser as one "
+            "payload -- this defeats the point of file-backed mode for viewing and can fail "
+            "outright on a large image. Leave use_datashader unset (defaults to True when "
+            "file-backed) or pass use_datashader=True explicitly, unless you specifically need "
+            "this combination and understand the cost."
+        )
+    return use_datashader
+
+
 def label_image_element(data, invert_y=False):
     """
     Helper function to wrap a 2D label_image into an hv.Image
@@ -751,7 +789,7 @@ def _revert_polygon_strokes_file_backed(writer, written_blocks):
 
 # Annotation functions
 
-def annotator(tissue_tag_annotation, plot_size=1024, invert_y=False, use_datashader=False,
+def annotator(tissue_tag_annotation, plot_size=1024, invert_y=False, use_datashader=None,
               unassigned_colour="yellow", annotation_aggregator='max', clear_paths_on_update=True,
               file_backed=False, file_backed_dir=None):
     """
@@ -771,7 +809,13 @@ def annotator(tissue_tag_annotation, plot_size=1024, invert_y=False, use_datasha
     invert_y : bool, optional
         invert plot along y axis
     use_datashader : bool, optional
-        If we should use datashader for rendering the image. Recommended for high resolution image. Default is False.
+        If we should use datashader for rendering the image. Recommended for high resolution image.
+        Default is None, which means: True whenever file-backed mode is active (either ``file_backed=True``
+        here, or ``tissue_tag_annotation`` is already file-backed), otherwise False. Without datashader,
+        rendering ships the *entire* image to the browser as one payload (no viewport-based downsampling),
+        which defeats the point of file-backed mode for viewing and can fail outright on a large image
+        (e.g. a browser-side "allocation size overflow" trying to allocate a buffer for the whole array).
+        Passing ``use_datashader=False`` explicitly while file-backed is still honoured, but warns.
     unassigned_colour : str, optional
         Color for unassigned pixels. Default is "yellow".
     annotation_aggregator : str, optional
@@ -807,6 +851,7 @@ def annotator(tissue_tag_annotation, plot_size=1024, invert_y=False, use_datasha
         tissue_tag_annotation.annotation_map.move_to_end("unassigned", last=False)
 
     use_file_backed = file_backed or tissue_tag_annotation.file_backed
+    use_datashader = _resolve_use_datashader(use_datashader, use_file_backed)
     if use_file_backed:
         if not tissue_tag_annotation.file_backed:
             tissue_tag_annotation.to_file_backed(file_backed_dir or tempfile.mkdtemp())
@@ -1227,7 +1272,7 @@ def plot_labels(tissue_tag_annotation, alpha=0.8):
     return overlay_labels(np.asarray(tissue_tag_annotation.image), annotation, alpha, show=True)
 
 
-def segmenter(tissue_tag_annotation, plot_size=1024, invert_y=False, use_datashader=False,
+def segmenter(tissue_tag_annotation, plot_size=1024, invert_y=False, use_datashader=None,
               annotation_prefix="object", label_aggregator='max', file_backed=False, file_backed_dir=None):
     """
     Interactive annotation tool to segment image using Panel to switch between morphology and annotation.
@@ -1251,7 +1296,9 @@ def segmenter(tissue_tag_annotation, plot_size=1024, invert_y=False, use_datasha
     invert_y : bool
         invert plot along y axis
     use_datashader : bool, optional
-        If we should use datashader for rendering the image. Recommended for high resolution image. Default is False.
+        If we should use datashader for rendering the image. Recommended for high resolution image.
+        Default is None, which means: True whenever file-backed mode is active, otherwise False.
+        See ``annotator`` for why this coupling exists.
     annotation_prefix : str, optional
         Prefix for annotations. Default is "object".
     label_aggregator : str, optional
@@ -1274,6 +1321,7 @@ def segmenter(tissue_tag_annotation, plot_size=1024, invert_y=False, use_datasha
 
     label_was_missing = tissue_tag_annotation.label_image is None and not tissue_tag_annotation.file_backed
     use_file_backed = file_backed or tissue_tag_annotation.file_backed
+    use_datashader = _resolve_use_datashader(use_datashader, use_file_backed)
     if use_file_backed:
         if not tissue_tag_annotation.file_backed:
             tissue_tag_annotation.to_file_backed(file_backed_dir or tempfile.mkdtemp())
