@@ -23,7 +23,9 @@ def run_tissuetag_visium_distance_pipeline(
     max_distance = None,
     drop_unassigned = True,
     plot = True,
-    copy_adata = False
+    copy_adata = False,
+    pairwise = False,
+    reference_categories = None,
 ):
     """
     Run Visium distance-mapping pipeline which are composed of the following steps:
@@ -58,6 +60,15 @@ def run_tissuetag_visium_distance_pipeline(
         If True, plots the coordinates of the grid space and the spot space to verify alignment. Default is True.
     copy_adata : bool, optional
         Return a new copy of the anndata object instead of modifying it in place. Default is False.
+    pairwise : bool, optional
+        If True, also compute pairwise distances between the reference points
+        (centre of mass of the k nearest points) of every pair of annotation
+        categories -- the third side of the P -- a_i -- a_j triangle. Produces
+        columns named like
+        ``L2_dist_pair_annotation_isocortex__white_matter_g10_k1``. Default False.
+    reference_categories : list of str, optional
+        Restrict distance / pairwise computation to this subset of categories.
+        If None (default), all categories are used.
 
     Returns
     -------
@@ -92,7 +103,9 @@ def run_tissuetag_visium_distance_pipeline(
     grid_df = calculate_distance_to_annotations(
         grid_df,
         knn=knn,
-        annotation_column=annotation_column
+        annotation_column=annotation_column,
+        pairwise=pairwise,
+        reference_categories=reference_categories,
     )
 
     # Get resolution of the Visium/Visium HD library
@@ -397,56 +410,132 @@ def map_annotations_to_target(df_source, df_target, ppm_target, ppm_source=1.0, 
     return df_target
 
 
-def calculate_distance_to_annotations(grid_df, knn=5, logscale=False, annotation_column='annotation'):
+def calculate_distance_to_annotations(
+    grid_df,
+    knn=5,
+    logscale=False,
+    annotation_column='annotation',
+    pairwise=False,
+    reference_categories=None,
+    verbose=True,
+):
     """
-    Calculate the nearest distance for each grid points to all annotation categories.
+    Calculate, for every grid point P, the distance to each annotation
+    category, and optionally the *pairwise* distances between the reference
+    points of different categories.
+
+    For each grid point P and category A, the reference point a(P, A) is the
+    centre of mass of the ``knn`` nearest grid points that carry annotation A
+    (this reduces to the single nearest point when ``knn == 1``). The classic
+    output is the per-category distance from P to A. When ``pairwise=True``
+    this function additionally returns, for every unordered pair of categories
+    (Ai, Aj), the distance between their reference points
+    |a(P, Ai) - a(P, Aj)| -- the third side of the triangle
+    P -- a(P, Ai) -- a(P, Aj), of which the two P-anchored sides are already
+    known. All outputs are distances (in the same units as the grid), so the
+    pairwise columns are directly comparable to the per-category columns.
+
+    Note on ``knn``: the per-category distance feature is the mean over the k
+    nearest neighbours (unchanged behaviour). The reference point used for the
+    pairwise distances is the centroid of those same k nearest neighbours, so
+    the kNN averaging logic is preserved on both sides.
 
     Parameters
     ----------
     grid_df : pandas.DataFrame
-        DataFrame containing the grid coordinates and annotations.
+        DataFrame containing the grid coordinates ('x', 'y') and annotations.
     knn : int, optional
-        Number of nearest neighbors to consider. Default is 5.
+        Number of nearest neighbors used for both the per-category distance
+        (mean of the k distances) and the reference point (centroid of the k
+        nearest). Default is 5. Use 1 for the true minimal distance / single
+        nearest reference point.
     logscale : bool, optional
         Use logarithmic scale (base 10) for distances. Default is False.
     annotation_column : str, optional
-        Column name for the annotation values within the grid dataframe. Default is 'annotation'.
+        Column name for the annotation values within the grid dataframe.
+        Default is 'annotation'.
+    pairwise : bool, optional
+        If True, also compute the pairwise distances between the reference
+        points of every pair of categories (the triangle's third side).
+        Default is False.
+    reference_categories : list of str, optional
+        Restrict the categories used for both distance and pairwise
+        computation to this subset. If None (default), all categories present
+        in ``annotation_column`` are used.
+    verbose : bool, optional
+        Print progress. Default is True.
 
     Returns
     -------
     pandas.DataFrame
-        DataFrame containing the grid coordinates and distances to each annotation category.
+        The input DataFrame with added columns:
+          - ``L2_dist_{annotation_column}_{A}`` : distance from P to category A
+            (or ``L2_dist_log10_...`` when ``logscale=True``).
+          - ``L2_dist_pair_{annotation_column}_{Ai}__{Aj}`` : distance between
+            the reference points of Ai and Aj (only when ``pairwise=True``).
     """
 
     grid_df = grid_df.copy()
-    print('calculating distance matrix')
+    if verbose:
+        print('calculating distance matrix')
 
     points = np.vstack([grid_df['x'], grid_df['y']]).T
-    categories = np.unique(grid_df[annotation_column])
+    n_points = points.shape[0]
 
-    dist_to_annotations = {c: np.zeros(grid_df.shape[0]) for c in categories}
+    labels = grid_df[annotation_column].astype(str).values
+    categories = list(np.unique(labels))
+    if reference_categories is not None:
+        keep = set(map(str, reference_categories))
+        categories = [c for c in categories if c in keep]
 
-    for idx, c in enumerate(categories):
-        indextmp = grid_df[annotation_column] == c
-        if np.sum(indextmp) > knn:
-            print(c)
-            cluster_points = points[indextmp]
-            tree = cKDTree(cluster_points)
-            # Get KNN nearest neighbors for each point
-            distances, _ = tree.query(points, k=knn)
-            # Store the mean distance for each point to the current category
-            if knn == 1:
-                dist_to_annotations[c] = distances  # No need to take mean if only one neighbor
-            else:
-                dist_to_annotations[c] = np.mean(distances, axis=1)
+    # Distance from P to each category, and the coordinates of the reference
+    # point a(P, A) = centre of mass of the k nearest points of that category.
+    dist_to_annotations = {}
+    ref_points = {}  # category -> (n_points, 2) reference-point coordinates
 
     for c in categories:
-        if logscale:
-            grid_df["L2_dist_log10_" + annotation_column + '_' + c] = np.log10(dist_to_annotations[c])
-        else:
-            grid_df["L2_dist_" + annotation_column + '_' + c] = dist_to_annotations[c]
+        mask = labels == c
+        n_c = int(mask.sum())
+        if n_c == 0:
+            continue
+        if verbose:
+            print(c)
+        cluster_points = points[mask]
+        tree = cKDTree(cluster_points)
+        k_eff = min(knn, n_c)
+        distances, indices = tree.query(points, k=k_eff)
+        # Normalise shapes so neighbours are always along axis 1
+        if k_eff == 1:
+            distances = distances[:, None]
+            indices = indices[:, None]
+        # Per-category distance feature (mean over the k nearest neighbours)
+        dist_to_annotations[c] = distances[:, 0] if knn == 1 else distances.mean(axis=1)
+        # Reference point = centre of mass of the k nearest neighbours of c
+        # (reduces to the single nearest point when knn == 1)
+        neighbour_coords = cluster_points[indices]        # (n_points, k_eff, 2)
+        ref_points[c] = neighbour_coords.mean(axis=1)     # (n_points, 2)
 
-    print(dist_to_annotations)
+    # Write per-category distance columns (classic behaviour)
+    for c in categories:
+        if c not in dist_to_annotations:
+            continue
+        d = dist_to_annotations[c]
+        if logscale:
+            grid_df["L2_dist_log10_" + annotation_column + '_' + c] = np.log10(d)
+        else:
+            grid_df["L2_dist_" + annotation_column + '_' + c] = d
+
+    # Pairwise distances between reference points (the triangle's "third side")
+    if pairwise:
+        if verbose:
+            print('calculating pairwise reference-point distances')
+        present = [c for c in categories if c in ref_points]
+        for i in range(len(present)):
+            for j in range(i + 1, len(present)):
+                ci, cj = present[i], present[j]
+                third_side = np.linalg.norm(ref_points[ci] - ref_points[cj], axis=1)
+                pair_col = "L2_dist_pair_" + annotation_column + '_' + ci + '__' + cj
+                grid_df[pair_col] = np.log10(third_side) if logscale else third_side
 
     return grid_df
 
