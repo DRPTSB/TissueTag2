@@ -197,15 +197,18 @@ def read_image(
     annotation_file: str, optional
         Path to GeoJSON object containing annotation features. Expects GeoJSON object in the structure of QuPath GeoJSON output.
     positions : str, Path or pandas.DataFrame, optional
-        Spot/cell positions, either as a DataFrame, or a path to a CSV/TSV/Parquet file to load. Must contain
-        the `positions_x_col`/`positions_y_col` columns, holding coordinates in microns relative to the
-        full-resolution image. If provided, `plot` will use plot_10x_spatial_image instead of a plain imshow.
+        Spot/cell/point positions, either as a DataFrame, or a path to a CSV/TSV/Parquet file to load. Must
+        contain the `positions_x_col`/`positions_y_col` columns, holding coordinates in microns relative to
+        the full-resolution image. Returned in the output TissueTagAnnotation with `pxl_col`/`pxl_row` columns
+        added (in output pixel space), regardless of `plot`/`plot_kwargs`.
     positions_x_col, positions_y_col : str, optional
         Column names to read x/y coordinates from in `positions`. Defaults to "pxl_col_in_fullres"/"pxl_row_in_fullres".
     plot : boolean, optional
         if to plot the loaded image. Defaults to True.
     plot_kwargs : dict, optional
-        Extra keyword arguments passed to plot_10x_spatial_image when `positions` is provided. Ignored otherwise.
+        If provided, `plot` uses plot_10x_spatial_image (with `positions` overlaid) instead of a plain imshow,
+        passing these as extra keyword arguments. Used internally by read_visium/read_visium_hd/read_xenium;
+        ignored otherwise (a plain imshow is used when calling read_image directly).
 
     Returns
     -------
@@ -263,8 +266,8 @@ def read_image(
             positions["pxl_row"] = positions[positions_y_col] * ppm_out
 
     if plot:
-        if positions is not None:
-            plot_10x_spatial_image(im, positions, ppm_out, **(plot_kwargs or {}))
+        if plot_kwargs is not None:
+            plot_10x_spatial_image(im, positions, ppm_out, **plot_kwargs)
         else:
             plt.figure(dpi=100)
             plt.imshow(im,origin='lower')
