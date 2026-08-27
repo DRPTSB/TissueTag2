@@ -336,6 +336,71 @@ def annotation_label_hover_tool(label_names):
     )
 
 
+def _hover_capture_hook(hover_tools):
+    """
+    Build a HoloViews plot hook that records the bokeh HoverTool(s) backing the rendered plot.
+
+    Note this deliberately does *not* use ``Toolbar.active_inspect`` / the tool's toolbar on/off
+    button state: that state (``Tool.active``) is a client-side-only JS property that is never
+    synced back to Python, and bokeh's own toolbar logic (as of bokeh 3.4) only ever *deactivates*
+    inspectors through ``active_inspect`` -- there is no code path that reactivates them, so a
+    disable-then-enable round trip via that property silently does nothing. Instead, this hook
+    grabs the actual ``HoverTool`` instance(s), whose ``tooltips`` property *is* synced, so a
+    widget can toggle tooltips on/off by clearing/restoring that property directly.
+
+    Parameters
+    ----------
+    hover_tools: list
+        Mutable list that ``(tool, original_tooltips)`` pairs are appended to (in place), one
+        per distinct ``bokeh.models.HoverTool`` found on the rendered plot.
+
+    Returns
+    -------
+    callable
+        A ``(plot, element)`` hook suitable for the holoviews ``hooks`` plot option.
+    """
+
+    def hook(plot, element):
+        seen = {tool for tool, _ in hover_tools}
+        for tool in plot.state.tools:
+            if isinstance(tool, HoverTool) and tool not in seen:
+                hover_tools.append((tool, tool.tooltips))
+                seen.add(tool)
+
+    return hook
+
+
+def build_hover_toggle_widget(hover_tools, value=True):
+    """
+    Build a toggle button that switches hover tooltips on/off for the given hover tools.
+
+    Parameters
+    ----------
+    hover_tools: list of (bokeh.models.HoverTool, tooltips)
+        Hover tools (collected via ``_hover_capture_hook``) paired with their original
+        ``tooltips`` value, so they can be switched on/off together.
+    value: bool, optional
+        Initial state of the toggle. Default is True (hover info shown).
+
+    Returns
+    -------
+    panel.widgets.Toggle
+        Warning-coloured toggle button; switching it shows/hides the hover tooltip on the
+        linked plot(s).
+    """
+
+    toggle = pn.widgets.Toggle(name='Show hover info', value=value, button_type='warning')
+
+    def toggle_hover(event):
+        for tool, original_tooltips in hover_tools:
+            # tooltips=None is bokeh's documented way to turn a HoverTool's popup off
+            # without removing the tool; restoring the original value turns it back on.
+            tool.tooltips = original_tooltips if event.new else None
+
+    toggle.param.watch(toggle_hover, 'value')
+    return toggle
+
+
 def build_annotation_toggle_widget(annotation_map):
     """
     Helper function to build a custom widget to allow user to toggle visibility of individual annotations
@@ -450,7 +515,7 @@ def label_image_element(data, invert_y=False):
 
 def label_image_overlay(label_pipe, palette, plot_size=1024, invert_y=False,
                         use_datashader=False, annotation_aggregator='max', opacity_param_object=None,
-                        annotation_toggle_param_object=None, annotation_names=None):
+                        annotation_toggle_param_object=None, annotation_names=None, hover_tools=None):
     """
     Build the dynamic, natively-coloured annotation overlay.
 
@@ -493,6 +558,10 @@ def label_image_overlay(label_pipe, palette, plot_size=1024, invert_y=False,
     annotation_names: list of str, optional`
         Names of the annotations in ``annotation_map`` order, so that ``annotation_names[i]`` is the name
         of the annotation with value ``i + 1``. Required if ``annotation_toggle_param_object`` is given.
+    hover_tools: list, optional
+        Mutable list that ``(HoverTool, original_tooltips)`` pairs are appended to (in place), so
+        a ``build_hover_toggle_widget`` toggle button can later switch the hover tooltip on/off.
+        Default is None (no hover tool reference is collected).
 
     Returns
     -------
@@ -551,6 +620,7 @@ def label_image_overlay(label_pipe, palette, plot_size=1024, invert_y=False,
         frame_width=int(plot_size),
         tools=[annotation_label_hover_tool(annotation_names)] if annotation_names is not None else ['hover'],
         backend_opts={"plot.toolbar_location": "left"},
+        hooks=[_hover_capture_hook(hover_tools)] if hover_tools is not None else [],
     )
 
     if opacity_param_object is not None:
@@ -688,6 +758,8 @@ def annotator(tissue_tag_annotation, plot_size=1024, invert_y=False, use_datasha
     annotation_toggle_param, annotation_toggle_widget = build_annotation_toggle_widget(
         tissue_tag_annotation.annotation_map
     )
+    hover_tools = []
+    hover_toggle_widget = build_hover_toggle_widget(hover_tools)
 
     # The label image is the single source of truth; the Pipe carries it to the plot.
     label_pipe = Pipe(data=tissue_tag_annotation.label_image)
@@ -697,7 +769,7 @@ def annotator(tissue_tag_annotation, plot_size=1024, invert_y=False, use_datasha
     ds_anno = label_image_overlay(label_pipe, palette, plot_size=plot_size, invert_y=invert_y,
                                   use_datashader=use_datashader, annotation_aggregator=annotation_aggregator,
                                   opacity_param_object=label_image_opacity, annotation_toggle_param_object=annotation_toggle_param,
-                                  annotation_names=annotation_names)
+                                  annotation_names=annotation_names, hover_tools=hover_tools)
 
     plot_list = [ds_img, ds_anno]
 
@@ -713,7 +785,7 @@ def annotator(tissue_tag_annotation, plot_size=1024, invert_y=False, use_datasha
     # Built once. Never rebuilt, so the bokeh plot (and the user's zoom/pan) survives updates.
     tab_object = pn.panel(hv.Overlay(plot_list).collate())
     p = pn.Column(
-        pn.Row(label_image_opacity, update_button, revert_button),
+        pn.Row(label_image_opacity, hover_toggle_widget, update_button, revert_button),
         annotation_toggle_widget,
         tab_object,
     )
@@ -1039,6 +1111,8 @@ def segmenter(tissue_tag_annotation, plot_size=1024, invert_y=False, use_datasha
     update_button = pn.widgets.Button(name='Update', button_type='primary')
     revert_button = pn.widgets.Button(name='Revert', button_type='danger', disabled=True)
     label_image_opacity = pn.widgets.FloatSlider(name='Label overlay', value=0.5, start=0, end=1, step=0.1)
+    hover_tools = []
+    hover_toggle_widget = build_hover_toggle_widget(hover_tools)
 
     label_pipe = Pipe(data=tissue_tag_annotation.label_image)
 
@@ -1046,7 +1120,7 @@ def segmenter(tissue_tag_annotation, plot_size=1024, invert_y=False, use_datasha
                                 invert_y=invert_y, use_datashader=use_datashader)
     ds_anno = label_image_overlay(label_pipe, palette, plot_size=plot_size, invert_y=invert_y,
                                   use_datashader=use_datashader, annotation_aggregator=label_aggregator,
-                                  opacity_param_object=label_image_opacity)
+                                  opacity_param_object=label_image_opacity, hover_tools=hover_tools)
 
     plot_list = [ds_img, ds_anno]
 
@@ -1062,7 +1136,7 @@ def segmenter(tissue_tag_annotation, plot_size=1024, invert_y=False, use_datasha
     plot_list.append(erase_path_object)
 
     tab_object = pn.panel(hv.Overlay(plot_list).collate())
-    p = pn.Column(pn.Row(label_image_opacity, update_button, revert_button), tab_object)
+    p = pn.Column(pn.Row(label_image_opacity, hover_toggle_widget, update_button, revert_button), tab_object)
 
     previous_label = tissue_tag_annotation.label_image.copy()
     previous_annotation_map = tissue_tag_annotation.annotation_map.copy()
