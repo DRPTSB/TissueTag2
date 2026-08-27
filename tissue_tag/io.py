@@ -71,6 +71,7 @@ class TissueTagAnnotation:
             if "unassigned" in old_keys and not "unassigned" in new_keys:
                 new_annotation_map["unassigned"] = self.annotation_map["unassigned"]
                 new_annotation_map.move_to_end("unassigned", last=False)
+                new_keys = list(new_annotation_map.keys())
 
             missing_keys = set(old_keys) - set(new_keys)
             if missing_keys:
