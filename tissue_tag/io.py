@@ -48,6 +48,51 @@ class TissueTagAnnotation:
         if self.grid is not None:
             self.grid.to_hdf(file_path, key="positions", mode="a")
 
+    def update_annotation_map(self, new_annotation_map: dict) -> None:
+        """
+        Updates the annotation_map in the TissueTagAnnotation object together with the values in label_image in place.
+
+        Requires all keys in existing annotation_map to be present in new_annotation_map.
+
+        Parameters
+        ----------
+        new_annotation_map : dict
+            The new annotation map to update the TissueTagAnnotation with.
+        """
+        print("Updating annotation_map...")
+        if self.label_image is None:
+            self.annotation_map = new_annotation_map
+        else:
+            new_annotation_map = OrderedDict(new_annotation_map)
+
+            old_keys = list(self.annotation_map.keys())
+            new_keys = list(new_annotation_map.keys())
+
+            if "unassigned" in old_keys and not "unassigned" in new_keys:
+                new_annotation_map["unassigned"] = self.annotation_map["unassigned"]
+                new_annotation_map.move_to_end("unassigned", last=False)
+
+            missing_keys = set(old_keys) - set(new_keys)
+            if missing_keys:
+                raise ValueError(f"new_annotation_map is missing existing keys: {missing_keys}")
+
+            print("Updating label_image...")
+            new_key_to_idx = {key: idx for idx, key in enumerate(new_keys)}
+            lut = np.array([new_key_to_idx[key] for key in old_keys], dtype=self.label_image.dtype)
+
+            # Check if label_image contain unassigned value
+            unassigned_set = int(np.min(self.label_image)) == 0
+
+            if unassigned_set:
+                np.take(lut.astype(self.label_image.dtype), self.label_image, out=self.label_image)
+            else:
+                self.label_image -= 1
+                np.take(lut.astype(self.label_image.dtype), self.label_image, out=self.label_image)
+                self.label_image += 1
+
+            self.annotation_map = new_annotation_map
+        print("Done")
+
 
 def load_annotation(file_path):
     """
