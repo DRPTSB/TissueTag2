@@ -68,8 +68,10 @@ class TissueTagAnnotation:
             old_keys = list(self.annotation_map.keys())
             new_keys = list(new_annotation_map.keys())
 
-            if "unassigned" in old_keys and not "unassigned" in new_keys:
-                new_annotation_map["unassigned"] = self.annotation_map["unassigned"]
+            if "unassigned" in old_keys:
+                if "unassigned" not in new_keys:
+                    new_annotation_map["unassigned"] = self.annotation_map["unassigned"]
+                # Force "unassigned" to always be the first key
                 new_annotation_map.move_to_end("unassigned", last=False)
                 new_keys = list(new_annotation_map.keys())
 
@@ -79,17 +81,14 @@ class TissueTagAnnotation:
 
             print("Updating label_image...")
             new_key_to_idx = {key: idx for idx, key in enumerate(new_keys)}
-            lut = np.array([new_key_to_idx[key] for key in old_keys], dtype=self.label_image.dtype)
 
-            # Check if label_image contain unassigned value
-            unassigned_set = int(np.min(self.label_image)) == 0
+            # label_image value 0 always means "no annotation assigned at all"
+            # (different from "unassigned", which if present will be 1)
+            lut = np.zeros(len(old_keys) + 1, dtype=self.label_image.dtype)
+            for idx, key in enumerate(old_keys):
+                lut[idx + 1] = new_key_to_idx[key] + 1
 
-            if unassigned_set:
-                np.take(lut.astype(self.label_image.dtype), self.label_image, out=self.label_image)
-            else:
-                self.label_image -= 1
-                np.take(lut.astype(self.label_image.dtype), self.label_image, out=self.label_image)
-                self.label_image += 1
+            np.take(lut, self.label_image, out=self.label_image)
 
             self.annotation_map = new_annotation_map
         print("Done")
