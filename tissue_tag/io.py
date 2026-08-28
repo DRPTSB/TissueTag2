@@ -14,11 +14,13 @@ from matplotlib.collections import PatchCollection
 import h5py
 import gzip
 import tifffile
+import xml.etree.ElementTree as ET
 
 @dataclass
 class TissueTagAnnotation:
     image: np.array
     ppm: float
+    # noinspection type-hints
     label_image: Optional[np.array] = None
     # Note that value 0 in label_image is a special value to indicate no annotation has been assigned
     annotation_map: Optional[dict] = None
@@ -91,10 +93,74 @@ def load_annotation(file_path):
     return TissueTagAnnotation(image, ppm, label_image, annotation_map, positions, grid)
 
 
-def _open_image(path, ppm_image = None, ppm_out = None):
+def extract_ppm(tiff_file):
+    """Extracts Pixels Per Micron (PPM) from OME-TIFF metadata or standard TIFF tags. Raises an error if no valid
+    PPM is found.
+
+    Parameters
+    ----------
+    tiff_file : str
+        Path to the TIFF file.
+
+    Returns
+    -------
+    float
+        Pixels per micron (PPM).
     """
-    Opens an image from disk. TIFF/OME-TIFF files are opened with tifffile, loading the pyramid level closest to
-    ppm_out (if the file is pyramidal). All other formats are opened directly with Pillow.
+
+    unit_to_microns = {
+        "m": 1e6,
+        "mm": 1000.0,
+        "um": 1.0,
+        "µm": 1.0,
+        "nm": 0.001,
+        "pm": 0.000001,
+    }
+
+    with tifffile.TiffFile(tiff_file) as tif:
+        # Parse OME-TIFF tags
+        if tif.ome_metadata:
+            root = ET.fromstring(tif.ome_metadata)
+
+            for elem in root.iter():
+                if elem.tag.endswith("Pixels") and "PhysicalSizeX" in elem.attrib:
+                    size_x = float(elem.attrib["PhysicalSizeX"])
+                    unit = elem.attrib.get("PhysicalSizeXUnit", "µm").strip()
+
+                    microns_per_px = size_x * unit_to_microns.get(
+                        unit.lower(), 1.0
+                    )
+                    ppm = 1.0 / microns_per_px
+                    return ppm
+
+        # Parse standard TIFF tags
+        page = tif.pages[0]
+        x_res_tag = page.tags.get("XResolution")
+        unit_tag = page.tags.get("ResolutionUnit")
+
+        if x_res_tag:
+            res_val = x_res_tag.value
+            px_per_unit = (
+                res_val[0] / res_val[1]
+                if isinstance(res_val, tuple)
+                else float(res_val)
+            )
+            unit_code = unit_tag.value if unit_tag else 1
+
+            if unit_code == 3:  # px/cm -> convert cm to µm (1 cm = 10,000 µm)
+                ppm = px_per_unit / 10000.0
+                return ppm
+            elif unit_code == 2:  # px/inch -> convert inch to µm (1 in = 25,400 µm)
+                ppm = px_per_unit / 25400.0
+                return ppm
+
+        raise ValueError("No spatial resolution metadata found")
+
+
+def _open_and_resize_image(path, ppm_image = None, ppm_out = None):
+    """
+    Opens an image from disk and resize based on the ppm_out value. TIFF/OME-TIFF files are opened with tifffile,
+    loading the pyramid level closest to ppm_out (if the file is pyramidal). All other formats are opened directly with Pillow.
 
     Parameters
     ----------
@@ -104,7 +170,9 @@ def _open_image(path, ppm_image = None, ppm_out = None):
         Pixels per microns of the input image. If not provided, this will be extracted from the image
         metadata with info['resolution']. If the metadata is not present, an error will be thrown.
     ppm_out : float, optional
-        Pixels per microns to load the closest pyramid level for, if the image is a pyramidal TIFF.
+        Pixels per microns of the output image.
+    raw : bool, optional
+        Whether to return the image as raw numpy array.
 
     Returns
     -------
@@ -116,99 +184,91 @@ def _open_image(path, ppm_image = None, ppm_out = None):
         Full width and height of the image at its native resolution.
     """
 
+    # Read in the image
     if Path(path).suffix.lower() in ('.tif', '.tiff'):
         with tifffile.TiffFile(path) as tf:
-            page = tf.pages[0]
-            full_width, full_height = page.shape[1], page.shape[0]
-            if not(ppm_image):
-                try:
-                    ppm_image = page.resolution[0]
-                    print('found ppm in image metadata!, its - '+str(ppm_image))
-                except:
-                    print('could not find ppm in image metadata, please provide ppm value')
+            im_meta = tf.pages[0]
+            full_width, full_height = im_meta.sizes["width"], im_meta.sizes["height"]
 
-            # pyramid levels (SubIFDs), if any, ordered from full res to lowest res
-            sub_pages = page.pages
-            level_widths = [full_width] + ([p.shape[1] for p in sub_pages] if sub_pages else [])
-            level = 0
-            if ppm_out and ppm_image and len(level_widths) > 1:
-                level_ppm = np.array(level_widths) / full_width * ppm_image
-                level = int(np.abs(level_ppm - ppm_out).argmin())
+            # calculate ppm for each pyramidal layer
+            widths = [im_meta.shape[1]] + ([page.shape[1] for page in im_meta.pages] if im_meta.pages else [])
+            pyramidal_ppm = (np.array(widths) / widths[0]) * ppm_image
 
-            im = Image.fromarray(tifffile.imread(path, is_ome=False, level=level))
+            # select the highest pyramidal layer to load
+            if ppm_out is None:
+                pyramid_layer = 0
+            else:
+                valid_pyramidal_ppm = pyramidal_ppm[pyramidal_ppm >= ppm_out]
+                pyramid_layer = len(valid_pyramidal_ppm)-1
+                ppm_image = valid_pyramidal_ppm[-1]
+            im =  Image.fromarray(tifffile.imread(path, is_ome=False, level=pyramid_layer))
     else:
         im = Image.open(path)
         full_width, full_height = im.size
-        if not(ppm_image):
+        if ppm_image is None:
             try:
                 ppm_image = im.info['resolution'][0]
                 print('found ppm in image metadata!, its - '+str(ppm_image))
             except:
                 print('could not find ppm in image metadata, please provide ppm value')
 
-    return im, ppm_image, full_width, full_height
+    # Resize the image if user supplies a ppm_out value
+    if ppm_out is None:
+        ppm_out = ppm_image
+    else:
+        width, height = im.size
+        new_size = (int(width / ppm_image * ppm_out), int(height / ppm_image * ppm_out))
+        im = im.resize(new_size, Image.Resampling.LANCZOS)
+
+    return im, ppm_out, full_width, full_height
 
 
-def read_image(
-    path = None,
-    image = None,
-    full_size = None,
-    ppm_image = None,
-    ppm_out = 1,
-    contrast_factor = 1,
-    background_image_path = None,
-    flip_y_axis = False,
-    annotation_file = None,
-    positions = None,
-    positions_x_col = 'pxl_col_in_fullres',
-    positions_y_col = 'pxl_row_in_fullres',
-    plot = True,
+def _read_image_core(
+    image,
+    full_size,
+    ppm_fullres,
+    ppm_out,
+    flip_y_axis,
+    annotation_file,
+    positions,
+    positions_x_col,
+    positions_y_col,
+    plot,
     plot_kwargs = None,
 ) -> TissueTagAnnotation:
     """
-    Reads an H&E or fluorescent image and returns the image with optional enhancements. This is also the shared
-    core used by read_visium/read_visium_hd/read_xenium, which load their own image/positions and pass them in
-    via the `image`/`full_size`/`positions` parameters instead of `path`.
+    Reads an H&E or fluorescent image and returns the image with optional enhancements. This is the shared
+    core used by read_visium/read_visium_hd/read_xenium/read_image, which load their own image/positions and
+    pass them in via the `image`/`full_size`/`positions` parameters.
 
     Parameters
     ----------
-    path : str, optional
-        Path to the image. The image must be in a format supported by Pillow, or a TIFF/OME-TIFF (read with
-        tifffile). Refer to https://pillow.readthedocs.io/en/stable/handbook/image-file-formats.html for the
-        list of formats supported by Pillow. Ignored if `image` is provided.
-    image : PIL.Image.Image or numpy.ndarray, optional
-        A pre-loaded image to use instead of opening `path`.
-    full_size : tuple, optional
-        (width, height) of `image` at its native/full resolution. Only used together with `image`, to correctly
-        map `annotation_file` coordinates. Defaults to the size of `image`.
-    ppm_image : float, optional
-        Pixels per microns of the input image. If not provided, this will be extracted from the image
-        metadata with info['resolution']. If the metadata is not present, an error will be thrown.
-    ppm_out : float, optional
-        Pixels per microns of the output image. If not provided, the native resolution of the input image is
-        kept. Defaults to 1.
-    contrast_factor : int, optional
-        Factor to adjust contrast for output image, typically between 2-5. Defaults to 1.
-    background_image_path : str, optional
-        Path to a background image. If provided, this image and the input image are combined
-        to create a virtual H&E (vH&E). If not provided, vH&E will not be performed.
-    flip_y_axis: bool, optional
-        Whether to flip the y-axis when loading in the image (default: False).
-    annotation_file: str, optional
-        Path to GeoJSON object containing annotation features. Expects GeoJSON object in the structure of QuPath GeoJSON output.
-    positions : str, Path or pandas.DataFrame, optional
+    image : PIL.Image.Image or numpy.ndarray
+        A pre-loaded image.
+    full_size : tuple
+        (width, height) of `image` at its native/full resolution, to correctly map `annotation_file` coordinates.
+    ppm_fullres : float
+        Pixels per microns of the input image.
+    ppm_out : float
+        Pixels per microns of the output image.
+    flip_y_axis: bool
+        Whether to flip the y-axis when loading in the image.
+    annotation_file: str
+        Path to GeoJSON object containing annotation features. Expects GeoJSON object in the structure of QuPath
+         GeoJSON output.
+    positions : str, Path or pandas.DataFrame
         Spot/cell/point positions, either as a DataFrame, or a path to a CSV/TSV/Parquet file to load. Must
         contain the `positions_x_col`/`positions_y_col` columns, holding coordinates in microns relative to
         the full-resolution image. Returned in the output TissueTagAnnotation with `pxl_col`/`pxl_row` columns
         added (in output pixel space), regardless of `plot`/`plot_kwargs`.
-    positions_x_col, positions_y_col : str, optional
-        Column names to read x/y coordinates from in `positions`. Defaults to "pxl_col_in_fullres"/"pxl_row_in_fullres".
-    plot : boolean, optional
-        if to plot the loaded image. Defaults to True.
+    positions_x_col, positions_y_col : str
+        Column names to read x/y coordinates from in `positions`.
+    plot : boolean
+        if to plot the loaded image.
     plot_kwargs : dict, optional
         If provided, `plot` uses plot_10x_spatial_image (with `positions` overlaid) instead of a plain imshow,
-        passing these as extra keyword arguments. Used internally by read_visium/read_visium_hd/read_xenium;
-        ignored otherwise (a plain imshow is used when calling read_image directly).
+        passing these as extra keyword arguments. Used internally by read_visium/read_visium_hd/read_xenium/
+        read_image; ignored otherwise (a plain imshow is used when calling read_image_core directly).
 
     Returns
     -------
@@ -216,39 +276,11 @@ def read_image(
         TissueTagAnnotation object containing the H&E or fluorescent image
     """
 
-    if image is not None:
-        # image is already at the desired ppm_out, nothing to resize
-        im = image if isinstance(image, Image.Image) else Image.fromarray(image)
-        full_width, full_height = full_size if full_size else im.size
-        if not(ppm_image):
-            ppm_image = ppm_out
-        newsize = im.size
-    else:
-        im, ppm_image, full_width, full_height = _open_image(path, ppm_image, ppm_out)
-        if not(ppm_out):
-            ppm_out = ppm_image
-        newsize = (int(full_width/ppm_image*ppm_out), int(full_height/ppm_image*ppm_out))
+    # image is already at the desired ppm_out, nothing to resize
+    im = image if isinstance(image, Image.Image) else Image.fromarray(image)
+    full_width, full_height = full_size
 
-    # resize
-    im = im.resize(newsize,Image.Resampling.LANCZOS)
     im = im.convert("RGBA")
-    #increase contrast
-    enhancer = ImageEnhance.Contrast(im)
-    factor = contrast_factor
-    im = enhancer.enhance(factor*factor)
-
-    if background_image_path:
-        im2, _, _, _ = _open_image(background_image_path, ppm_image, ppm_out)
-        # resize
-        im2 = im2.resize(newsize,Image.Resampling.LANCZOS)
-        im2 = im2.convert("RGBA")
-        #increase contrast
-        enhancer = ImageEnhance.Contrast(im2)
-        factor = contrast_factor
-        im2 = enhancer.enhance(factor*factor)
-        # virtual H&E
-        # im2 = im2.convert("RGBA")
-        im = simonson_vHE(np.array(im).astype('uint8'),np.array(im2).astype('uint8'))
 
     im = np.array(im)
     if flip_y_axis:
@@ -257,13 +289,15 @@ def read_image(
     if positions is not None:
         if isinstance(positions, (str, Path)):
             positions_path = Path(positions)
-            positions = pd.read_parquet(positions_path) if positions_path.suffix == '.parquet' else pd.read_csv(positions_path, index_col=0)
-        positions = positions.copy()
-        positions["pxl_col"] = positions[positions_x_col] * ppm_out
-        if flip_y_axis:
-            positions["pxl_row"] = (im.shape[0] - 1) - positions[positions_y_col] * ppm_out
+            positions = pd.read_parquet(positions_path) if positions_path.suffix == '.parquet' else pd.read_csv(
+                positions_path, index_col=0)
         else:
-            positions["pxl_row"] = positions[positions_y_col] * ppm_out
+            positions = positions.copy()
+        positions["pxl_col"] = positions[positions_x_col] / ppm_fullres * ppm_out
+        if flip_y_axis:
+            positions["pxl_row"] = (im.shape[0] - 1) - positions[positions_y_col] / ppm_fullres * ppm_out
+        else:
+            positions["pxl_row"] = positions[positions_y_col] / ppm_fullres * ppm_out
 
     if plot:
         if plot_kwargs is not None:
@@ -281,6 +315,106 @@ def read_image(
         label_image, annotation_map = None, None
 
     return TissueTagAnnotation(image=im, ppm=ppm_out, label_image=label_image, annotation_map=annotation_map, positions=positions)
+
+
+def read_image(
+    path,
+    ppm_image,
+    ppm_out = 1,
+    contrast_factor = 1,
+    background_image_path = None,
+    flip_y_axis = False,
+    annotation_file = None,
+    positions = None,
+    positions_x_col = 'x',
+    positions_y_col = 'y',
+    plot = True,
+    plot_kwargs = None,
+) -> TissueTagAnnotation:
+    """
+    Reads an H&E or fluorescent image and returns the image with optional enhancements. If
+    `background_image_path` is provided, it is combined with `path` into a virtual H&E (vH&E) image using
+    `simonson_vHE` before further processing. Delegates to `read_image_core` for the shared
+    resize/contrast/flip/positions/annotation/plot logic.
+
+    Parameters
+    ----------
+    path : str
+        Path to the image. The image must be in a format supported by Pillow, or a TIFF/OME-TIFF (read with
+        tifffile). Refer to https://pillow.readthedocs.io/en/stable/handbook/image-file-formats.html for the
+        list of formats supported by Pillow.
+    ppm_image : float, optional
+        Pixels per microns of the input image. If not provided, this will be extracted from the image
+        metadata. If the metadata is not present, an error will be thrown.
+    ppm_out : float, optional
+        Pixels per microns of the output image. Defaults to 1.
+    contrast_factor : int, optional
+        Factor to adjust contrast for output image, typically between 2-5. Defaults to 1.
+    background_image_path : str, optional
+        Path to a background image. If provided, this image and `path` are combined to create a virtual H&E
+        (vH&E). If not provided, vH&E will not be performed.
+    flip_y_axis: bool, optional
+        Whether to flip the y-axis when loading in the image (default: False).
+    annotation_file: str, optional
+        Path to GeoJSON object containing annotation features. Expects GeoJSON object in the structure of QuPath GeoJSON output.
+    positions : str, Path or pandas.DataFrame, optional
+        Spot/cell/point positions, either as a DataFrame, or a path to a CSV/TSV/Parquet file to load. Must
+        contain the `positions_x_col`/`positions_y_col` columns, holding coordinates in microns relative to
+        the full-resolution image. Returned in the output TissueTagAnnotation with `pxl_col`/`pxl_row` columns
+        added (in output pixel space), regardless of `plot`/`plot_kwargs`.
+    positions_x_col, positions_y_col : str, optional
+        Column names to read x/y coordinates from in `positions`. Defaults to "pxl_col_in_fullres"/"pxl_row_in_fullres".
+    plot : boolean, optional
+        if to plot the loaded image. Defaults to True.
+    plot_kwargs : dict, optional
+        If provided, `plot` uses plot_10x_spatial_image (with `positions` overlaid) instead of a plain imshow,
+        passing these as extra keyword arguments.
+
+    Returns
+    -------
+    TissueTagAnnotation
+        TissueTagAnnotation object containing the H&E or fluorescent image
+    """
+
+    if ppm_image is None:
+        try:
+            ppm_image = extract_ppm(path)
+            print('found ppm in image metadata!, its - ' + str(ppm_image))
+        except:
+            print('could not find ppm in image metadata, please provide ppm value')
+
+    im, ppm_out, full_width, full_height = _open_and_resize_image(path, ppm_image, ppm_out)
+    im = im.convert("RGBA")
+    #increase contrast
+    enhancer = ImageEnhance.Contrast(im)
+    factor = contrast_factor
+    im = enhancer.enhance(factor*factor)
+
+    if background_image_path:
+        im2, ppm_out2, full_width2, full_height2 = _open_and_resize_image(background_image_path, ppm_image, ppm_out)
+        if full_width != full_width2 or full_height != full_height2:
+            raise ValueError("Background image dimensions do not match the main image.")
+
+        im2 = im2.convert("RGBA")
+        #increase contrast
+        enhancer = ImageEnhance.Contrast(im2)
+        im2 = enhancer.enhance(factor*factor)
+        # virtual H&E
+        im = simonson_vHE(np.array(im).astype('uint8'), np.array(im2).astype('uint8'))
+
+    return _read_image_core(
+        image=im,
+        full_size=(full_width, full_height),
+        ppm_fullres=ppm_image,
+        ppm_out=ppm_out,
+        flip_y_axis=flip_y_axis,
+        annotation_file=annotation_file,
+        positions=positions,
+        positions_x_col=positions_x_col,
+        positions_y_col=positions_y_col,
+        plot=plot,
+        plot_kwargs=plot_kwargs,
+    )
 
 
 def read_visium(
@@ -353,9 +487,6 @@ def read_visium(
 
     if in_tissue:
         df = df[df['in_tissue'] > 0]
-    # adjust to fullres
-    df["pxl_row_in_fullres"] /= fullres_ppm
-    df["pxl_col_in_fullres"] /= fullres_ppm
 
     # Load images
     spaceranger_spatial_path = Path(spaceranger_dir_path + '/spatial')
@@ -374,13 +505,18 @@ def read_visium(
 
     ppm_anno = fullres_ppm * scalefactors[f"tissue_{use_resolution}_scalef"] if use_resolution != "mapped_res" else fullres_ppm # adjust resolution to the image
 
-    return read_image(
-        path=image_files[use_resolution],
-        ppm_image=ppm_anno,
+    im, ppm_out, full_width, full_height = _open_and_resize_image(image_files[use_resolution], ppm_anno, ppm_out)
+
+    return _read_image_core(
+        image=im,
+        full_size=(full_width, full_height),
+        ppm_fullres=fullres_ppm,
         ppm_out=ppm_out,
         flip_y_axis=flip_y_axis,
         annotation_file=annotation_file,
         positions=df,
+        positions_x_col='pxl_col_in_fullres',
+        positions_y_col='pxl_row_in_fullres',
         plot=plot,
         plot_kwargs=dict(target_diameter_um=55, dpi=300, blowup_size_um=250, technology="Visium",
                           image_info="Image resolution: " + use_resolution),
@@ -456,9 +592,6 @@ def read_visium_hd(
 
     if in_tissue:
         df = df[df["in_tissue"] > 0]
-    # adjust to fullres
-    df["pxl_row_in_fullres"] /= fullres_ppm
-    df["pxl_col_in_fullres"] /= fullres_ppm
 
     # Load images
     spaceranger_spatial_path = Path(spaceranger_dir_path + f'/spatial')
@@ -477,13 +610,18 @@ def read_visium_hd(
 
     ppm_anno = fullres_ppm * scalefactors[f"tissue_{use_resolution}_scalef"] if use_resolution != "mapped_res" else fullres_ppm # adjust resolution to the image
 
-    return read_image(
-        path=image_files[use_resolution],
-        ppm_image=ppm_anno,
+    im, ppm_out, full_width, full_height = _open_and_resize_image(image_files[use_resolution], ppm_anno, ppm_out)
+
+    return _read_image_core(
+        image=im,
+        full_size=(full_width, full_height),
+        ppm_fullres=fullres_ppm,
         ppm_out=ppm_out,
         flip_y_axis=flip_y_axis,
         annotation_file=annotation_file,
         positions=df,
+        positions_x_col='pxl_col_in_fullres',
+        positions_y_col='pxl_row_in_fullres',
         plot=plot,
         plot_kwargs=dict(target_diameter_um=int(bin_resolution), dpi=300, blowup_size_um=320, technology="VisiumHD",
                           image_info="Image resolution: " + use_resolution),
@@ -565,16 +703,14 @@ def read_xenium(
     # image file paths
     image_files = sorted([f for f in morphology_path.glob("*.ome.tif") if f.is_file()])
 
-    if ppm_out is None:
-        ppm_out = fullres_ppm
-
     if image_output == "virtualHE":
         fluorescence_channels = [1, 2, 3, 0]
         channel_colours = "grayscale"
 
     stacked_im = None
+    _ppm_out = ppm_out
     for channel in fluorescence_channels:
-        im, ppm_image, full_width, full_height = _open_image(image_files[channel], fullres_ppm, ppm_out)
+        im, ppm_out, full_width, full_height = _open_and_resize_image(image_files[channel], fullres_ppm, _ppm_out)
         im = np.array(im)
 
         low_quantile, high_quantile = np.quantile(im, q=image_quantiles[0]), np.quantile(im, q=image_quantiles[1])
@@ -582,9 +718,6 @@ def read_xenium(
         im = ((im - low_quantile) / (high_quantile - low_quantile) * 255).astype(np.uint8)
 
         im = Image.fromarray(im).convert("L")
-
-        new_size = (int(full_width / ppm_image * ppm_out), int(full_height / ppm_image * ppm_out))
-        im = im.resize(new_size, Image.Resampling.LANCZOS)
 
         if channel_colours != "grayscale":
             im = ImageOps.colorize(im, black="black", white=ImageColor.getcolor(channel_colours[channel], "RGB"))
@@ -603,10 +736,10 @@ def read_xenium(
 
     print(stacked_im.shape)
 
-    return read_image(
+    return _read_image_core(
         image=stacked_im,
         full_size=(full_width, full_height),
-        ppm_image=ppm_out,
+        ppm_fullres=1, # Special case as the Xenium cells already have the x,y value adjusted to the full resolution
         ppm_out=ppm_out,
         flip_y_axis=flip_y_axis,
         annotation_file=annotation_file,
