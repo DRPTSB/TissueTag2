@@ -391,13 +391,17 @@ def build_hover_toggle_widget(hover_tools, value=True):
 
     toggle = pn.widgets.Toggle(name='Show hover info', value=value, button_type='warning')
 
-    def toggle_hover(event):
+    def _set_hover_state(show_hover):
         for tool, original_tooltips in hover_tools:
-            # tooltips=None is bokeh's documented way to turn a HoverTool's popup off
-            # without removing the tool; restoring the original value turns it back on.
-            tool.tooltips = original_tooltips if event.new else None
+            # HoverTool has no ``active`` property; ``visible`` cleanly disables/enables it.
+            tool.tooltips = original_tooltips if show_hover else None
+            tool.visible = bool(show_hover)
+
+    def toggle_hover(event):
+        _set_hover_state(event.new)
 
     toggle.param.watch(toggle_hover, 'value')
+    _set_hover_state(value)
     return toggle
 
 
