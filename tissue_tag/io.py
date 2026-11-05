@@ -38,17 +38,17 @@ class TissueTagAnnotation:
         """
         with h5py.File(file_path, 'w') as f:
             if self.image is not None:
-                f.create_dataset('image', data=self.image)
+                f.create_dataset('image', data=self.image, compression='gzip')
             if self.ppm is not None:
                 f.create_dataset('ppm', data=self.ppm)
             if self.label_image is not None:
-                f.create_dataset('label_image', data=self.label_image)
+                f.create_dataset('label_image', data=self.label_image, compression='gzip')
             if self.annotation_map is not None:
                 f.create_dataset('annotation_map', data=json.dumps(self.annotation_map))
         if self.positions is not None:
             self.positions.to_hdf(file_path, key="positions", mode="a")
         if self.grid is not None:
-            self.grid.to_hdf(file_path, key="positions", mode="a")
+            self.grid.to_hdf(file_path, key="grid", mode="a")
 
 
 def load_annotation(file_path):
