@@ -160,19 +160,18 @@ def extract_ppm(tiff_file):
 def _open_and_resize_image(path, ppm_image = None, ppm_out = None):
     """
     Opens an image from disk and resize based on the ppm_out value. TIFF/OME-TIFF files are opened with tifffile,
-    loading the pyramid level closest to ppm_out (if the file is pyramidal). All other formats are opened directly with Pillow.
+    loading the smallest pyramid level that is still at or above ppm_out (if the file is pyramidal), so the image
+    is only ever downsampled. All other formats are opened directly with Pillow.
 
     Parameters
     ----------
-    path : str
+    path : str or Path
         Path to the image.
     ppm_image : float, optional
         Pixels per microns of the input image. If not provided, this will be extracted from the image
         metadata with info['resolution']. If the metadata is not present, an error will be thrown.
     ppm_out : float, optional
-        Pixels per microns of the output image.
-    raw : bool, optional
-        Whether to return the image as raw numpy array.
+        Pixels per microns of the output image. If not provided, the image is returned at its native resolution.
 
     Returns
     -------
@@ -188,19 +187,25 @@ def _open_and_resize_image(path, ppm_image = None, ppm_out = None):
     if Path(path).suffix.lower() in ('.tif', '.tiff'):
         with tifffile.TiffFile(path) as tf:
             im_meta = tf.pages[0]
-            full_width, full_height = im_meta.sizes["width"], im_meta.sizes["height"]
+            full_width, full_height = im_meta.imagewidth, im_meta.imagelength
 
             # calculate ppm for each pyramidal layer
-            widths = [im_meta.shape[1]] + ([page.shape[1] for page in im_meta.pages] if im_meta.pages else [])
+            widths = [im_meta.imagewidth] + ([page.imagewidth for page in im_meta.pages] if im_meta.pages else [])
             pyramidal_ppm = (np.array(widths) / widths[0]) * ppm_image
 
             # select the highest pyramidal layer to load
-            if ppm_out is None:
+            # (levels are ordered from the largest to the smallest)
+            valid_pyramidal_ppm = pyramidal_ppm if ppm_out is None else pyramidal_ppm[pyramidal_ppm >= ppm_out]
+            if ppm_out is None or len(valid_pyramidal_ppm) == 0:
+                # ppm_out is None: keep native resolution. No valid level: ppm_out is above the native resolution,
+                # so the full resolution level is loaded and upsampled.
                 pyramid_layer = 0
+                if ppm_out is not None:
+                    print(f'ppm_out ({ppm_out}) is higher than the native resolution of the image ({ppm_image}), '
+                          f'the image will be upsampled.')
             else:
-                valid_pyramidal_ppm = pyramidal_ppm[pyramidal_ppm >= ppm_out]
                 pyramid_layer = len(valid_pyramidal_ppm)-1
-                ppm_image = valid_pyramidal_ppm[-1]
+            ppm_image = pyramidal_ppm[pyramid_layer]
             im =  Image.fromarray(tifffile.imread(path, is_ome=False, level=pyramid_layer))
     else:
         im = Image.open(path)
@@ -258,8 +263,8 @@ def _read_image_core(
          GeoJSON output.
     positions : str, Path or pandas.DataFrame
         Spot/cell/point positions, either as a DataFrame, or a path to a CSV/TSV/Parquet file to load. Must
-        contain the `positions_x_col`/`positions_y_col` columns, holding coordinates in microns relative to
-        the full-resolution image. Returned in the output TissueTagAnnotation with `pxl_col`/`pxl_row` columns
+        contain the `positions_x_col`/`positions_y_col` columns, holding coordinates in full-resolution pixels
+        (i.e. at `ppm_fullres`; pass ppm_fullres=1 for coordinates in microns). Returned in the output TissueTagAnnotation with `pxl_col`/`pxl_row` columns
         added (in output pixel space), regardless of `plot`/`plot_kwargs`.
     positions_x_col, positions_y_col : str
         Column names to read x/y coordinates from in `positions`.
@@ -334,8 +339,8 @@ def read_image(
     """
     Reads an H&E or fluorescent image and returns the image with optional enhancements. If
     `background_image_path` is provided, it is combined with `path` into a virtual H&E (vH&E) image using
-    `simonson_vHE` before further processing. Delegates to `read_image_core` for the shared
-    resize/contrast/flip/positions/annotation/plot logic.
+    `simonson_vHE` before further processing. Delegates to `_read_image_core` for the shared
+    flip/positions/annotation/plot logic.
 
     Parameters
     ----------
@@ -359,11 +364,11 @@ def read_image(
         Path to GeoJSON object containing annotation features. Expects GeoJSON object in the structure of QuPath GeoJSON output.
     positions : str, Path or pandas.DataFrame, optional
         Spot/cell/point positions, either as a DataFrame, or a path to a CSV/TSV/Parquet file to load. Must
-        contain the `positions_x_col`/`positions_y_col` columns, holding coordinates in microns relative to
-        the full-resolution image. Returned in the output TissueTagAnnotation with `pxl_col`/`pxl_row` columns
-        added (in output pixel space), regardless of `plot`/`plot_kwargs`.
+        contain the `positions_x_col`/`positions_y_col` columns, holding coordinates in pixels of the
+        full-resolution image at `path` (i.e. at `ppm_image`). Returned in the output TissueTagAnnotation with
+        `pxl_col`/`pxl_row` columns added (in output pixel space), regardless of `plot`/`plot_kwargs`.
     positions_x_col, positions_y_col : str, optional
-        Column names to read x/y coordinates from in `positions`. Defaults to "pxl_col_in_fullres"/"pxl_row_in_fullres".
+        Column names to read x/y coordinates from in `positions`. Defaults to "x"/"y".
     plot : boolean, optional
         if to plot the loaded image. Defaults to True.
     plot_kwargs : dict, optional
@@ -432,7 +437,7 @@ def read_visium(
 
     Parameters
     ----------
-    spaceranger_dir_path : str
+    spaceranger_dir_path : str or Path
         Directory containing Visium library data.
     use_resolution : {'hires', 'lowres', 'mapped_res'}, optional
         Desired image resolution. 'mapped_res' refers to the original image that was sent to SpaceRanger
@@ -461,19 +466,20 @@ def read_visium(
     """
 
 
+    spaceranger_spatial_path = Path(spaceranger_dir_path) / 'spatial'
+
     # Load scale factors
-    scalefactors_file = spaceranger_dir_path + 'spatial/scalefactors_json.json'
+    scalefactors_file = spaceranger_spatial_path / 'scalefactors_json.json'
     with open(scalefactors_file, "r") as f:
         scalefactors = json.load(f)
 
     fullres_ppm = scalefactors['spot_diameter_fullres'] / 55 # Harcoded as visium has a fixed spot size of 55um
 
     # Load tissue positions future proofing
-    spaceranger_spatial_dir_path = Path(spaceranger_dir_path  + '/spatial')
     tissue_positions_file = next(
         (f for f in [
-            spaceranger_spatial_dir_path / "tissue_positions.csv",
-            spaceranger_spatial_dir_path / "tissue_positions_list.csv"
+            spaceranger_spatial_path / "tissue_positions.csv",
+            spaceranger_spatial_path / "tissue_positions_list.csv"
         ] if f.exists()),
         None
     )
@@ -487,9 +493,6 @@ def read_visium(
 
     if in_tissue:
         df = df[df['in_tissue'] > 0]
-
-    # Load images
-    spaceranger_spatial_path = Path(spaceranger_dir_path + '/spatial')
 
     # image file paths
     image_files = {
@@ -538,10 +541,11 @@ def read_visium_hd(
 
     Parameters
     ----------
-    spaceranger_dir_path : str
+    spaceranger_dir_path : str or Path
         Directory containing Visium HD library data.
-    bin_resolution : str, optional
-        Resolution of the Visium HD bins to use. Binning level can be - '02','08','16'. Defaults to 16.
+    bin_resolution : str or int, optional
+        Resolution of the Visium HD bins to use, in microns. Binning level can be - 2, 8 or 16 (as int or str,
+        e.g. '02', '8', 16). Defaults to 16.
     use_resolution : {'hires', 'lowres', 'mapped_res'}, optional
         Desired image resolution. 'mapped_res' refers to the original image that was sent to SpaceRanger
         along with sequencing data. If 'mapped_res' is specified, `mapped_image_path` must also be provided.
@@ -568,33 +572,39 @@ def read_visium_hd(
     """
 
 
+    bin_um = int(bin_resolution)
+    spaceranger_dir_path = Path(spaceranger_dir_path)
+    bin_spatial_path = spaceranger_dir_path / 'binned_outputs' / f'square_{bin_um:03d}um' / 'spatial'
+
     # Load scale factors
-    scalefactors_file = spaceranger_dir_path + f'/binned_outputs/square_0{bin_resolution}um/spatial/scalefactors_json.json'
+    scalefactors_file = bin_spatial_path / 'scalefactors_json.json'
     with open(scalefactors_file, "r") as f:
         scalefactors = json.load(f)
 
     fullres_ppm = 1/scalefactors["microns_per_pixel"] # get to micron scale from pixels
 
     # Load tissue positions future proofing
-    spaceranger_spatial_dir_path = Path(spaceranger_dir_path + f'/binned_outputs/square_0{bin_resolution}um/spatial/')  # Convert to Path
     tissue_positions_file = next(
         (f for f in [
-            spaceranger_spatial_dir_path / "tissue_positions.parquet",
-            spaceranger_spatial_dir_path / "tissue_positions.csv",
-            spaceranger_spatial_dir_path / "tissue_positions_list.csv"
+            bin_spatial_path / "tissue_positions.parquet",
+            bin_spatial_path / "tissue_positions.csv",
+            bin_spatial_path / "tissue_positions_list.csv"
         ] if f.exists()),
         None
     )
-    if tissue_positions_file.suffix == ".csv":
-        df = pd.read_csv(tissue_positions_file, index_col=0)
-    elif tissue_positions_file.suffix == ".parquet":
+    if tissue_positions_file.suffix == ".parquet":
         df = pd.read_parquet(tissue_positions_file).set_index("barcode")
+    elif tissue_positions_file.name.endswith("_list.csv"): # headerless format
+        col_names = ['barcode', 'in_tissue', 'array_row', 'array_col', 'pxl_row_in_fullres', 'pxl_col_in_fullres']
+        df = pd.read_csv(tissue_positions_file, header=None, names=col_names).set_index('barcode')
+    else:
+        df = pd.read_csv(tissue_positions_file).set_index('barcode')
 
     if in_tissue:
         df = df[df["in_tissue"] > 0]
 
     # Load images
-    spaceranger_spatial_path = Path(spaceranger_dir_path + f'/spatial')
+    spaceranger_spatial_path = spaceranger_dir_path / 'spatial'
 
     # image file paths
     image_files = {
@@ -623,7 +633,7 @@ def read_visium_hd(
         positions_x_col='pxl_col_in_fullres',
         positions_y_col='pxl_row_in_fullres',
         plot=plot,
-        plot_kwargs=dict(target_diameter_um=int(bin_resolution), dpi=300, blowup_size_um=320, technology="VisiumHD",
+        plot_kwargs=dict(target_diameter_um=bin_um, dpi=300, blowup_size_um=320, technology="VisiumHD",
                           image_info="Image resolution: " + use_resolution),
     )
 
@@ -643,7 +653,7 @@ def read_xenium(
 
     Parameters
     ----------
-    xeniumranger_dir_path : str
+    xeniumranger_dir_path : str or Path
         Directory containing Xenium library data.
     ppm_out : float, optional
         Target resolution in pixels per micron.
@@ -685,23 +695,27 @@ def read_xenium(
             raise ValueError(
                 "Need to specify channel colours as either 'grayscale' or a list of 4 channel colours in hex.")
 
+    xeniumranger_dir_path = Path(xeniumranger_dir_path)
+
     # Load xenium metadata
-    metadata_file = xeniumranger_dir_path + f'/experiment.xenium'
+    metadata_file = xeniumranger_dir_path / 'experiment.xenium'
     with open(metadata_file, "r") as f:
         metadata = json.load(f)
 
     fullres_ppm = 1/metadata["pixel_size"] # get to micron scale from pixels
 
     # Load cell positions
-    cell_position =  xeniumranger_dir_path + f'/cells.csv.gz'
+    cell_position = xeniumranger_dir_path / 'cells.csv.gz'
     with gzip.open(cell_position, 'rt') as f:
         df = pd.read_csv(f, index_col=0)
 
     # Load images
-    morphology_path = Path(xeniumranger_dir_path + f'/morphology_focus/')
+    morphology_path = xeniumranger_dir_path / 'morphology_focus'
 
     # image file paths
     image_files = sorted([f for f in morphology_path.glob("*.ome.tif") if f.is_file()])
+    if not image_files:
+        raise FileNotFoundError(f"No morphology focus images (*.ome.tif) found in '{morphology_path}'.")
 
     if image_output == "virtualHE":
         fluorescence_channels = [1, 2, 3, 0]
@@ -714,7 +728,7 @@ def read_xenium(
         im = np.array(im)
 
         low_quantile, high_quantile = np.quantile(im, q=image_quantiles[0]), np.quantile(im, q=image_quantiles[1])
-        im[im > high_quantile] = high_quantile
+        im = np.clip(im.astype(np.float64), low_quantile, high_quantile)
         im = ((im - low_quantile) / (high_quantile - low_quantile) * 255).astype(np.uint8)
 
         im = Image.fromarray(im).convert("L")
