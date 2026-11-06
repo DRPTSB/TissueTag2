@@ -554,6 +554,9 @@ def read_visium(
     ppm_anno = fullres_ppm * scalefactors[f"tissue_{use_resolution}_scalef"] if use_resolution != "mapped_res" else fullres_ppm # adjust resolution to the image
 
     im, ppm_out, full_width, full_height = _open_and_resize_image(image_files[use_resolution], ppm_anno, ppm_out)
+    if use_resolution != "mapped_res":  # annotation_file is drawn on the original image: scale size back up
+        scalef = scalefactors[f"tissue_{use_resolution}_scalef"]
+        full_width, full_height = round(full_width / scalef), round(full_height / scalef)
 
     return _read_image_core(
         image=im,
@@ -666,6 +669,9 @@ def read_visium_hd(
     ppm_anno = fullres_ppm * scalefactors[f"tissue_{use_resolution}_scalef"] if use_resolution != "mapped_res" else fullres_ppm # adjust resolution to the image
 
     im, ppm_out, full_width, full_height = _open_and_resize_image(image_files[use_resolution], ppm_anno, ppm_out)
+    if use_resolution != "mapped_res":  # annotation_file is drawn on the original image: scale size back up
+        scalef = scalefactors[f"tissue_{use_resolution}_scalef"]
+        full_width, full_height = round(full_width / scalef), round(full_height / scalef)
 
     return _read_image_core(
         image=im,
