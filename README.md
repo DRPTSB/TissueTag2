@@ -16,9 +16,7 @@ TissueTag2 consists of two major components:
 
 2) **Mapping annotations to data**: This components converts the pixel based annotations to an hexagonal grid to allow calculation of distances between morphological structures offering continuous annotation. This calculation is dependent of the grid sampling frequency and the number of grid spots that we define as a spatial neighborhood. This is foundational for calculating a morphological axis (OrganAxis, see tutorials).
 
-*Note: A labeled image is an integer array where each pixel value (0,1,2,...) corresponds to an annotated structure.*
-
-We envision this tool as a starting point, so contributions and suggestions are highly appreciated!
+We envision this tool as a starting point for other uses, so contributions and suggestions are highly appreciated!
 
 ## Installation
 
