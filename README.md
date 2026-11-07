@@ -6,7 +6,9 @@
 
 # TissueTag2: a Jupyter-based tissue annotation tool for large scale and consistent analysis of spatial omics datasets
 
+## Introduction
 
+TissueTag2 is an interactive tissue-space annotation tool designed for seamless integration into Jupyter Notebook pipelines. TissueTag2 works on the image space and is thus compatible with any spatial modality that has a paired fluorescent and brightfield image. 
 
 TissueTag2 consists of two major components:
 
