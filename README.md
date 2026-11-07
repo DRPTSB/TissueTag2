@@ -50,7 +50,6 @@ We supply four examples of usage for TissueTag2 annotations:
 ## Usage on a cluster vs local machine 
 Bokeh interactive plotting required communication between the notebook instance and the browser. 
 We have tested the functionality of TissueTag with jupyter lab or jupyter notebooks but have not yet found a solution that works for jupyter hub.
-In addition SSH tunnelling is not supported as well but if you are accessing the notebook from outside your institute, VPN access should work fine. 
 
 ## How to cite:
 Please cite the GitHub repository for TissueTag2. 
