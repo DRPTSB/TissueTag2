@@ -48,13 +48,13 @@ We supply four examples of usage for TissueTag2 annotations:
    [IBEX annotation tutorial](https://github.com/DRPTSB/TissueTag2/blob/main/Tutorials/demo_flourscent_map_annotations_to_cells.ipynb). Next, we show how one can migrate these annotations to segmented cells and calulcate a morphological axis (OrganAxis) [IBEX mapping annotations tutorial](https://github.com/DRPTSB/TissueTag2/blob/main/Tutorials/demo_flourscent_map_annotations_to_cells.ipynb).
    
 ## Usage on a cluster vs local machine 
-Bokeh interactive plotting required communication between the notebook instance and the browser. 
+Bokeh interactive plotting requires communication between the notebook instance and the browser. 
 We have tested the functionality of TissueTag with jupyter lab or jupyter notebooks but have not yet found a solution that works for jupyter hub.
 
 ## How to cite:
 Please cite the GitHub repository for TissueTag2. 
 
 ## Previous version:
-TissueTag2 builds upon the principles of it's previous version [TissueTag](https://github.com/Teichlab/TissueTag) image annotation tool with major re-architectural changes to support large-scale spatial omics data and an expanded  compatibility in variuos farm platforms while also ensuring reproducibility for a more seamless annotation experience.
+TissueTag2 builds upon the principles of its previous version [TissueTag](https://github.com/Teichlab/TissueTag) image annotation tool with major re-architectural changes to support large-scale spatial omics data and an expanded compatibility in various computing platforms while also ensuring reproducibility for a more seamless annotation experience.
 
 
