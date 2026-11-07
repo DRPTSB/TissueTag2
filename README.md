@@ -4,10 +4,9 @@
 	<img src="https://github.com/DRPTSB/TissueTag2/blob/main/tissueTag2_logo.png" width="300">
 </p>
 
-# TissueTag2: a Jupyter-based image annotation tool for large scale spatial transcriptomics data
+# TissueTag2: a Jupyter-based tissue annotation tool for large scale and consistent analysis of spatial omics datasets
 
-TissueTag2 builds upon the original [TissueTag](https://github.com/Teichlab/TissueTag) image annotation tool with re-architectural changes to support large-scale spatial transcriptomics data and an enhanced user interface for 
-a more seamless annotation experience.
+
 
 TissueTag2 consists of two major components:
 
@@ -55,5 +54,8 @@ In addition SSH tunnelling is not supported as well but if you are accessing the
 
 ## How to cite:
 Please cite the GitHub repository for TissueTag2. 
+
+## Previous version:
+TissueTag2 builds upon the principles of it's previous version [TissueTag](https://github.com/Teichlab/TissueTag) image annotation tool with major re-architectural changes to support large-scale spatial omics data and an expanded  compatibility in variuos farm platforms while also ensuring reproducibility for a more seamless annotation experience.
 
 
